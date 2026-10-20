@@ -9,7 +9,7 @@ use std::thread;
 use fileweaver_core::{
     CancellationToken, CollisionPolicy, Divergence, ExecuteError, ExecuteProgress, Executor,
     JobReview, JobSummary, Journal, JournalError, OperationKind, PlanRequest, PlannedJob,
-    RollbackReport, Rule, RulePipeline, plan,
+    RollbackReport, Rule, RulePipeline, SortOrder, plan,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -116,6 +116,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if had_plan && let Some(ui) = weak.upgrade() {
                 ui.set_can_apply(false);
                 ui.set_risk_budget("".into());
+                ui.set_order_summary("".into());
                 ui.set_status(
                     "Settings changed since the preview. Select Refresh preview to review the updated plan before applying."
                         .into(),
@@ -127,6 +128,15 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.run()
 }
 
+fn sort_from_index(index: i32) -> SortOrder {
+    match index {
+        1 => SortOrder::Name,
+        2 => SortOrder::ModifiedOldest,
+        3 => SortOrder::CaptureDateOldest,
+        _ => SortOrder::Path,
+    }
+}
+
 fn request_from_ui(ui: &MainWindow) -> PlanRequest {
     PlanRequest {
         inputs: vec![PathBuf::from(ui.get_folder_path().trim())],
@@ -136,6 +146,7 @@ fn request_from_ui(ui: &MainWindow) -> PlanRequest {
         include_directories: false,
         collision_policy: CollisionPolicy::Block,
         allow_legacy_long_paths: false,
+        sort: sort_from_index(ui.get_sort_index()),
     }
 }
 
@@ -171,9 +182,11 @@ fn schedule_preview(
     }
 
     let pipeline = pipeline_from_ui(&ui);
+    let counter_enabled = ui.get_add_counter();
     let request = request_from_ui(&ui);
     ui.set_can_apply(false);
     ui.set_risk_budget("".into());
+    ui.set_order_summary("".into());
     ui.set_status(
         if use_current_rules {
             "Refreshing the non-destructive preview…"
@@ -188,6 +201,7 @@ fn schedule_preview(
             let rows = rows_for_plan(&new_plan);
             let summary = summary_text(&new_plan);
             let risk_budget = risk_budget_text(&new_plan);
+            let order_summary = order_summary_text(&new_plan, counter_enabled);
             let executable = new_plan.is_executable();
             let plan_for_check = new_plan.clone();
             if let Ok(mut current) = state.plan.lock() {
@@ -202,6 +216,7 @@ fn schedule_preview(
                 if plan_is_current(&plan_for_check, &ui) {
                     ui.set_status(summary.into());
                     ui.set_risk_budget(risk_budget.into());
+                    ui.set_order_summary(order_summary.into());
                     ui.set_can_apply(executable);
                 } else {
                     ui.set_status(
@@ -209,6 +224,7 @@ fn schedule_preview(
                             .into(),
                     );
                     ui.set_risk_budget("".into());
+                    ui.set_order_summary("".into());
                     ui.set_can_apply(false);
                 }
             });
@@ -250,6 +266,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         }
         ui.set_can_apply(false);
         ui.set_risk_budget("".into());
+        ui.set_order_summary("".into());
         ui.set_status(
             "The folder or rules changed since this preview. Refresh the preview and review it before applying."
                 .into(),
@@ -290,6 +307,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
             ui.set_applying(false);
             ui.set_can_apply(false);
             ui.set_risk_budget("".into());
+            ui.set_order_summary("".into());
             match result {
             Ok(outcome) if outcome.cancelled => ui.set_status(
                 format!(
@@ -673,6 +691,73 @@ fn schedule_rollback(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     });
 }
 
+/// The value of the last digit run in a proposed name's stem, when that run
+/// is exactly four digits (the shell's fixed counter width).
+fn counter_value(proposed_name: &str) -> Option<u64> {
+    let stem = match proposed_name.rfind('.') {
+        Some(dot) if dot > 0 => &proposed_name[..dot],
+        _ => proposed_name,
+    };
+    let bytes = stem.as_bytes();
+    let mut run: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            run = Some((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    let (start, end) = run?;
+    if end - start != 4 {
+        return None;
+    }
+    stem[start..end].parse().ok()
+}
+
+fn order_summary_text(plan: &PlannedJob, counter_enabled: bool) -> String {
+    let mut text = format!(
+        "Order: {} · {} file(s) in this order.",
+        plan.request.sort.label(),
+        plan.summary.discovered
+    );
+    if counter_enabled {
+        let values: Vec<u64> = plan
+            .actions
+            .iter()
+            .filter(|action| action.will_change())
+            .filter_map(|action| counter_value(&action.proposed_name))
+            .collect();
+        if let (Some(min), Some(max)) = (values.iter().min(), values.iter().max()) {
+            text.push_str(&format!(" Assigned counters run _{min:04} to _{max:04}."));
+        }
+    }
+    for gap in plan.sequence_gaps.iter().take(2) {
+        let missing = gap
+            .missing
+            .iter()
+            .take(5)
+            .map(|value| format!("{value:0width$}", width = gap.width))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            " Possible gap in {}: missing {missing}.",
+            gap.pattern
+        ));
+    }
+    if plan.sequence_gaps.len() > 2 {
+        text.push_str(&format!(
+            " (+{} more patterns with gaps.)",
+            plan.sequence_gaps.len() - 2
+        ));
+    }
+    text
+}
+
 fn operation_ledger_path() -> PathBuf {
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -697,6 +782,7 @@ mod tests {
             include_directories: false,
             collision_policy: CollisionPolicy::Block,
             allow_legacy_long_paths: false,
+            sort: SortOrder::Path,
         };
         let pipeline = RulePipeline {
             rules: vec![Rule::AddPrefix {

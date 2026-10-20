@@ -338,6 +338,7 @@ mod tests {
                 include_directories: false,
                 collision_policy: CollisionPolicy::Block,
                 allow_legacy_long_paths: false,
+                sort: crate::domain::SortOrder::Path,
             },
             pipeline_json: "{}".into(),
             global_issues: vec![],
@@ -367,6 +368,7 @@ mod tests {
                 blocking_errors: 0,
                 cross_volume_candidates: 0,
             },
+            sequence_gaps: vec![],
         }
     }
 

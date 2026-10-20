@@ -14,7 +14,7 @@ pub mod rules;
 
 pub use domain::{
     CollisionPolicy, FileFingerprint, FileSnapshot, JobOutcome, OperationKind, PlanIssue,
-    PlanIssueKind, PlanRequest, PlannedAction, PlannedJob, Severity,
+    PlanIssueKind, PlanRequest, PlannedAction, PlannedJob, SequenceGap, Severity, SortOrder,
 };
 pub use executor::{
     CancellationToken, Divergence, ExecuteError, ExecuteProgress, Executor, ItemReview, JobReview,

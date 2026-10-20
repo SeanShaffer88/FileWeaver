@@ -1,4 +1,4 @@
-import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct PreviewRow {
     old_name: string,
@@ -24,7 +24,9 @@ export component MainWindow inherits Window {
     in-out property <bool> recursive: false;
     in-out property <bool> can_apply: false;
     in-out property <bool> applying: false;
+    in-out property <int> sort_index: 0;
     in-out property <string> risk_budget: "";
+    in-out property <string> order_summary: "";
     in-out property <string> status: "Choose a folder or paste its path, then select Scan to create a safe preview.";
     in-out property <[PreviewRow]> rows: [];
     in-out property <[LedgerRow]> ledger_rows: [];
@@ -135,11 +137,19 @@ export component MainWindow inherits Window {
                         accessible-label: "Replacement text";
                         accessible-description: "Replacement for the Find text. An empty value removes matching text.";
                     }
+                    Text { text: "Numbering order"; font-weight: 600; }
+                    ComboBox {
+                        model: ["Path (A–Z)", "Name (A–Z)", "Modified (oldest first)", "Capture date (oldest first)"];
+                        current-index <=> root.sort_index;
+                        selected => { root.inputs_changed(); }
+                        accessible-label: "Numbering order";
+                        accessible-description: "The order files are numbered and processed in. Capture date uses JPEG Exif capture time; files without one go last.";
+                    }
                     CheckBox {
                         text: "Append stable counter";
                         checked <=> root.add_counter;
                         toggled => { root.inputs_changed(); }
-                        accessible-description: "Append a four-digit number before the extension. Files are ordered by their full path, ignoring case.";
+                        accessible-description: "Append a four-digit number before the extension, assigned in the numbering order selected above.";
                     }
                     Button {
                         text: "Refresh preview";
@@ -167,6 +177,12 @@ export component MainWindow inherits Window {
                         wrap: word-wrap;
                         color: #334155;
                         accessible-label: "Risk summary";
+                    }
+                    Text {
+                        text: root.order_summary;
+                        wrap: word-wrap;
+                        color: #334155;
+                        accessible-label: "Order summary";
                     }
                     HorizontalLayout {
                         Text { text: "Current name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
