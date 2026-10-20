@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A local-first Windows file organization and batch-renaming studio"
-license = "GPL-2.0-only"
+license = "MIT"
 repository = "https://github.com/SeanShaffer88/FileWeaver"
 build = "build.rs"
 
