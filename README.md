@@ -13,6 +13,8 @@
 - Applies same-volume rename cycles safely by staging source files using unique temporary names.
 - Supports copy/move logic in the core API; cross-volume moves use copy-to-unique-temp, size verification, commit, then source deletion.
 - Records applied items in a local SQLite operation ledger and supplies conservative rollback in the core API. Rollback rejects files whose recorded post-operation fingerprint has changed.
+- Shows a **Risk Budget** line with every preview: how many files will change, are blocked, need review, or stay unchanged — and that the plan overwrites nothing.
+- Provides a **Recovery ledger** panel in the shell: recent jobs can be selected to review how their files look now (unchanged, changed, or missing, using the same fingerprint check rollback performs), then rolled back behind a two-step confirmation. Rollback restores only unchanged files whose original location is still free; changed or missing files are never overwritten.
 - Reads JPEG Exif capture timestamps (`.jpg`/`.jpeg`, `DateTimeOriginal` then `DateTimeDigitized`) while planning. The core date rule can use them; the first UI slice does not expose that rule yet.
 - Exposes Slint accessibility metadata for the implemented controls, keyboard-focusable standard controls, and status text.
 
@@ -23,7 +25,6 @@
 - UI controls for the regex, case, and date/Exif rules and for copy/move destination templates. Those exist in the core API, but none should be represented as complete UI features.
 - CSV/JSON mapping, saved presets, and report export. These have **no implementation yet**, in the core or the UI.
 - Folder mutation, watched folders, Explorer context menu, portable-data mode, CLI automation, hash/duplicate analysis, metadata writing, document-content classification, integrations, and networking.
-- A UI “Undo this job” surface. The underlying `Executor::rollback` exists and is covered by a cycle rollback test, but it needs an audited recovery review UX before it can be safely offered.
 - Stable Windows file IDs for rollback. This build uses a conservative size + modification-time fingerprint, so it may reject safe recovery and cannot prove identity against an adversarial or coincidental replacement.
 - Windows VM testing, real Windows screen-reader testing, high-contrast testing, installer creation, code signing, or clean-machine runtime verification.
 
@@ -105,7 +106,7 @@ ui/main.slint     Accessible desktop shell
 | **Apply is disabled** | The preview has blocking issues, no changes, or no folder was scanned. Read each row’s status; the initial UI needs better issue filtering. |
 | **A path is not scanned** | Check spelling, access permissions, and whether it is a symbolic link. The current build deliberately skips symlinks/reparse-point-like links. |
 | **“Target appeared after preview”** | Another program changed the folder after planning. Refresh the preview; the executor refuses to overwrite it. |
-| **Recovery skips a file** | The destination’s size/modification fingerprint differs from the recorded post-operation result, or its original location is occupied. Preserve both files and resolve manually; this early build has no guided recovery UI. |
+| **Recovery skips a file** | The destination’s size/modification fingerprint differs from the recorded post-operation result, or its original location is occupied. The Recovery ledger’s review shows which files are unchanged, changed, or missing before you roll back; preserve both files and resolve skipped ones manually. |
 | **Behaviour on Linux/macOS** | Not a supported platform. The core and shell compile there and the core tests pass, which is useful during development, but the Windows filename rules and the Windows UX are neither meaningful nor validated off Windows. |
 
 ## License

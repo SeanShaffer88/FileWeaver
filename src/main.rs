@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use fileweaver_core::{
-    CancellationToken, CollisionPolicy, ExecuteProgress, Executor, Journal, OperationKind,
-    PlanRequest, PlannedJob, Rule, RulePipeline, plan,
+    CancellationToken, CollisionPolicy, Divergence, ExecuteError, ExecuteProgress, Executor,
+    JobReview, JobSummary, Journal, JournalError, OperationKind, PlanRequest, PlannedJob,
+    RollbackReport, Rule, RulePipeline, plan,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -18,6 +19,8 @@ slint::include_modules!();
 struct AppState {
     plan: Mutex<Option<PlannedJob>>,
     cancellation: Mutex<Option<CancellationToken>>,
+    ledger_job_ids: Mutex<Vec<i64>>,
+    selected_job_id: Mutex<Option<i64>>,
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -61,6 +64,44 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
     });
+
+    ui.on_refresh_ledger({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || refresh_ledger(weak.clone(), Arc::clone(&state))
+    });
+
+    ui.on_select_job({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            select_job(
+                weak.clone(),
+                Arc::clone(&state),
+                usize::try_from(index).unwrap_or(usize::MAX),
+            )
+        }
+    });
+
+    ui.on_rollback_selected({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || schedule_rollback(weak.clone(), Arc::clone(&state))
+    });
+
+    // Initial history load is synchronous: it is a small bounded read, and
+    // the event loop is not running yet to receive a posted update.
+    match Journal::open(operation_ledger_path()).and_then(|journal| journal.list_jobs(20)) {
+        Ok(jobs) => {
+            if let Ok(mut ids) = state.ledger_job_ids.lock() {
+                *ids = jobs.iter().map(|job| job.id).collect();
+            }
+            apply_ledger_jobs(&ui, &jobs);
+        }
+        Err(error) => {
+            ui.set_ledger_detail(format!("Could not read the operation ledger: {error}").into());
+        }
+    }
 
     ui.on_inputs_changed({
         let state = Arc::clone(&state);
@@ -244,6 +285,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         if let Ok(mut guard) = state_for_finish.cancellation.lock() {
             *guard = None;
         }
+        refresh_ledger(weak.clone(), Arc::clone(&state_for_finish));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_applying(false);
             ui.set_can_apply(false);
@@ -400,6 +442,235 @@ fn risk_budget_text(plan: &PlannedJob) -> String {
         ));
     }
     text
+}
+
+fn kind_label(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Rename => "Rename",
+        OperationKind::Move => "Move",
+        OperationKind::Copy => "Copy",
+    }
+}
+
+fn format_unix_ms(ms: i64) -> String {
+    let nanos = i128::from(ms) * 1_000_000;
+    match time::OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+        Ok(moment) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            moment.year(),
+            u8::from(moment.month()),
+            moment.day(),
+            moment.hour(),
+            moment.minute()
+        ),
+        Err(_) => "unknown time".into(),
+    }
+}
+
+fn ledger_row_for(job: &JobSummary) -> LedgerRow {
+    let mut detail = format!("{} · {} applied", job.status, job.applied_items);
+    if job.failed_items > 0 {
+        detail.push_str(&format!(" · {} failed", job.failed_items));
+    }
+    if job.rolled_back_items > 0 {
+        detail.push_str(&format!(" · {} rolled back", job.rolled_back_items));
+    }
+    if let Some(message) = &job.message {
+        detail.push_str(&format!(" · {message}"));
+    }
+    LedgerRow {
+        heading: format!(
+            "#{} · {} · {}",
+            job.id,
+            kind_label(job.operation),
+            format_unix_ms(job.started_unix_ms)
+        )
+        .into(),
+        detail: detail.into(),
+    }
+}
+
+fn apply_ledger_jobs(ui: &MainWindow, jobs: &[JobSummary]) {
+    let rows: Vec<LedgerRow> = jobs.iter().map(ledger_row_for).collect();
+    ui.set_ledger_rows(ModelRc::new(Rc::new(VecModel::from(rows))));
+    ui.set_selected_job_index(-1);
+    ui.set_can_rollback(false);
+    ui.set_confirming_rollback(false);
+    ui.set_ledger_detail(
+        if jobs.is_empty() {
+            "No jobs recorded yet. Jobs you apply will appear here for review and rollback."
+        } else {
+            "Select a job to review how its files look now."
+        }
+        .into(),
+    );
+}
+
+fn refresh_ledger(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    thread::spawn(move || {
+        let result: Result<Vec<JobSummary>, JournalError> = (|| {
+            let journal = Journal::open(operation_ledger_path())?;
+            journal.list_jobs(20)
+        })();
+        match result {
+            Ok(jobs) => {
+                if let Ok(mut ids) = state.ledger_job_ids.lock() {
+                    *ids = jobs.iter().map(|job| job.id).collect();
+                }
+                if let Ok(mut selected) = state.selected_job_id.lock() {
+                    *selected = None;
+                }
+                let _ = weak.upgrade_in_event_loop(move |ui| apply_ledger_jobs(&ui, &jobs));
+            }
+            Err(error) => {
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_ledger_detail(
+                        format!("Could not read the operation ledger: {error}").into(),
+                    );
+                });
+            }
+        }
+    });
+}
+
+fn select_job(weak: slint::Weak<MainWindow>, state: Arc<AppState>, index: usize) {
+    let job_id = state
+        .ledger_job_ids
+        .lock()
+        .ok()
+        .and_then(|ids| ids.get(index).copied());
+    let Some(job_id) = job_id else {
+        return;
+    };
+    if let Ok(mut selected) = state.selected_job_id.lock() {
+        *selected = Some(job_id);
+    }
+    if let Some(ui) = weak.upgrade() {
+        ui.set_selected_job_index(i32::try_from(index).unwrap_or(-1));
+        ui.set_confirming_rollback(false);
+        ui.set_can_rollback(false);
+        ui.set_ledger_detail("Reviewing this job against the current files…".into());
+    }
+
+    thread::spawn(move || {
+        let result: Result<JobReview, ExecuteError> = (|| {
+            let journal = Journal::open(operation_ledger_path())?;
+            Executor::new(journal).review(job_id)
+        })();
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(review) => {
+                ui.set_ledger_detail(review_detail_text(&review).into());
+                ui.set_can_rollback(review.safely_reversible() > 0);
+            }
+            Err(error) => {
+                ui.set_ledger_detail(format!("Could not review job #{job_id}: {error}").into());
+                ui.set_can_rollback(false);
+            }
+        });
+    });
+}
+
+fn review_detail_text(review: &JobReview) -> String {
+    let total = review.items.len();
+    if total == 0 {
+        return format!(
+            "Job #{} ({}): no applied files remain to review — already rolled back, or nothing was applied.",
+            review.job_id,
+            kind_label(review.operation).to_lowercase()
+        );
+    }
+    let occupied = review
+        .items
+        .iter()
+        .filter(|item| item.original_occupied)
+        .count();
+    let mut text = format!(
+        "Job #{} ({}): {} file(s) checked — {} unchanged, {} changed since the job, {} missing.",
+        review.job_id,
+        kind_label(review.operation).to_lowercase(),
+        total,
+        review.count(Divergence::Intact),
+        review.count(Divergence::Changed),
+        review.count(Divergence::Missing)
+    );
+    if occupied > 0 {
+        text.push_str(&format!(
+            " {occupied} original location(s) are occupied again."
+        ));
+    }
+    let reversible = review.safely_reversible();
+    if reversible > 0 {
+        text.push_str(&format!(
+            " Rollback can safely restore {reversible} file(s); changed or missing files are never overwritten."
+        ));
+    } else {
+        text.push_str(" Nothing in this job can be safely rolled back.");
+    }
+    text
+}
+
+fn schedule_rollback(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    if !ui.get_confirming_rollback() {
+        ui.set_confirming_rollback(true);
+        ui.set_status(
+            "Confirm rollback: unchanged files get their original names back, and changed or missing files are never overwritten. Select Roll back again to proceed."
+                .into(),
+        );
+        return;
+    }
+    ui.set_confirming_rollback(false);
+    let job_id = state
+        .selected_job_id
+        .lock()
+        .ok()
+        .and_then(|selected| *selected);
+    let Some(job_id) = job_id else {
+        ui.set_status("Select a job in the recovery ledger first.".into());
+        return;
+    };
+    ui.set_can_rollback(false);
+    ui.set_status(format!("Rolling back job #{job_id}…").into());
+
+    thread::spawn(move || {
+        let result: Result<RollbackReport, ExecuteError> = (|| {
+            let journal = Journal::open(operation_ledger_path())?;
+            let mut executor = Executor::new(journal);
+            executor.rollback(job_id)
+        })();
+        refresh_ledger(weak.clone(), Arc::clone(&state));
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(report) => {
+                let first_skip = report
+                    .skipped
+                    .first()
+                    .map(|item| {
+                        format!(
+                            " First skipped: {} — {}",
+                            item.destination.display(),
+                            item.reason
+                        )
+                    })
+                    .unwrap_or_default();
+                ui.set_status(
+                    format!(
+                        "Rollback of job #{}: {} restored, {} copied file(s) removed, {} skipped.{}",
+                        job_id,
+                        report.restored,
+                        report.removed_copies,
+                        report.skipped.len(),
+                        first_skip
+                    )
+                    .into(),
+                );
+            }
+            Err(error) => {
+                ui.set_status(format!("Rollback of job #{job_id} failed: {error}").into());
+            }
+        });
+    });
 }
 
 fn operation_ledger_path() -> PathBuf {

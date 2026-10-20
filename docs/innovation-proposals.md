@@ -4,6 +4,8 @@ Companion to [`fileweaver-market-and-architecture.md`](fileweaver-market-and-arc
 
 **Honesty rules used here.** Distinctiveness is a *hypothesis*, not a claim — §3 of the architecture doc establishes what comparable products verifiably do, and nothing below asserts uniqueness beyond that evidence. "Status" statements were checked against the source on 2026-10-20.
 
+**Progress since this review (2026-10-20):** #2 Risk Budget shipped (PR #1) — every preview shows its change/blocked/review/unchanged counts and zero-overwrite guarantee. #1 Rename Ledger completion shipped (PR #2) — the shell now lists recorded jobs, reviews each against the current disk state (unchanged / changed / missing / original-location-occupied), and rolls back behind a two-step confirmation, restoring only unchanged files. Next in the ranking: #3 Order Observatory.
+
 ## Where the code already stands
 
 - The **Rename Ledger exists in the core**: the SQLite journal stores each job's request and rule pipeline as JSON plus per-item source/destination paths and size + modification-time fingerprints, and `Executor::rollback` preflights those fingerprints and skips diverged files. What is missing is any UI for it and any divergence *report*.
