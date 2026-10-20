@@ -590,7 +590,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         CollisionPolicy, FileFingerprint, FileSnapshot, OperationKind, PlanRequest, PlanSummary,
-        PlannedAction, PlannedJob,
+        PlannedAction, PlannedJob, SortOrder,
     };
     use crate::journal::Journal;
     use tempfile::tempdir;
@@ -626,6 +626,7 @@ mod tests {
                 include_directories: false,
                 collision_policy: CollisionPolicy::Block,
                 allow_legacy_long_paths: false,
+                sort: SortOrder::Path,
             },
             pipeline_json: "{}".into(),
             global_issues: vec![],
@@ -638,6 +639,7 @@ mod tests {
                 blocking_errors: 0,
                 cross_volume_candidates: 0,
             },
+            sequence_gaps: vec![],
         }
     }
 
@@ -691,6 +693,7 @@ mod tests {
             include_directories: false,
             collision_policy: CollisionPolicy::Block,
             allow_legacy_long_paths: false,
+            sort: SortOrder::Path,
         };
         let pipeline = RulePipeline {
             rules: vec![Rule::AddPrefix { text: "x-".into() }],

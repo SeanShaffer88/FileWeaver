@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::domain::{
     CollisionPolicy, FileFingerprint, FileSnapshot, OperationKind, PlanIssue, PlanIssueKind,
-    PlanRequest, PlanSummary, PlannedAction, PlannedJob, Severity,
+    PlanRequest, PlanSummary, PlannedAction, PlannedJob, SequenceGap, Severity, SortOrder,
 };
 use crate::metadata;
 use crate::rules::{RulePipeline, RuleProblem};
@@ -21,9 +21,9 @@ pub enum PlanError {
 
 /// Produces a plan without changing the filesystem.
 ///
-/// Files are sorted by an explicit, stable case-insensitive path key. This is
-/// intentionally simple rather than “whatever order the filesystem returns”,
-/// because the key becomes the numbering order shown to users.
+/// Files are sorted by the request's explicit, stable sort order rather than
+/// “whatever order the filesystem returns”, because that order becomes the
+/// numbering order shown to users (see the Order Observatory in the shell).
 pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob, PlanError> {
     let mut global_issues = Vec::new();
     let pipeline_is_valid = match pipeline.validate() {
@@ -98,6 +98,24 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
 
     apply_collision_validation(&mut actions, request.collision_policy);
 
+    let sequence_gaps = detect_sequence_gaps(&actions);
+    for gap in &sequence_gaps {
+        global_issues.push(PlanIssue::warning(
+            PlanIssueKind::SequenceGap,
+            format!(
+                "Possible sequence gap in {}: {} file(s) match {}, but {} number(s) in the range are missing (first missing: {}). A gap can be legitimate — for example a deleted photo — so nothing is blocked.",
+                gap.folder.display(),
+                gap.present,
+                gap.pattern,
+                gap.missing_count,
+                gap.missing
+                    .first()
+                    .map(|value| format!("{value:0width$}", width = gap.width))
+                    .unwrap_or_default(),
+            ),
+        ));
+    }
+
     let summary = summarize(&actions, &global_issues);
     Ok(PlannedJob {
         request,
@@ -105,6 +123,7 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
         global_issues,
         actions,
         summary,
+        sequence_gaps,
     })
 }
 
@@ -184,8 +203,140 @@ fn collect_snapshots(request: &PlanRequest) -> (Vec<FileSnapshot>, Vec<PlanIssue
             Err(issue) => issues.push(issue),
         }
     }
-    snapshots.sort_by_key(|snapshot| stable_path_key(&snapshot.source));
+    sort_snapshots(&mut snapshots, request.sort);
     (snapshots, issues)
+}
+
+/// Applies the plan's numbering order. Every comparison ends with the stable
+/// path key, so the result is fully deterministic even when the chosen key
+/// ties (same name in different folders, identical timestamps).
+fn sort_snapshots(snapshots: &mut [FileSnapshot], order: SortOrder) {
+    let path_cmp = |a: &FileSnapshot, b: &FileSnapshot| {
+        stable_path_key(&a.source).cmp(&stable_path_key(&b.source))
+    };
+    match order {
+        SortOrder::Path => snapshots.sort_by(path_cmp),
+        SortOrder::Name => snapshots.sort_by(|a, b| {
+            a.original_name
+                .to_lowercase()
+                .cmp(&b.original_name.to_lowercase())
+                .then_with(|| path_cmp(a, b))
+        }),
+        SortOrder::ModifiedOldest => snapshots.sort_by(|a, b| {
+            // Files without a modification time sort last.
+            let key = |s: &FileSnapshot| (s.modified_unix_nanos.is_none(), s.modified_unix_nanos);
+            key(a).cmp(&key(b)).then_with(|| path_cmp(a, b))
+        }),
+        SortOrder::CaptureDateOldest => snapshots.sort_by(|a, b| {
+            // The stored capture string is kamadak-exif's fixed-width
+            // "YYYY-MM-DD HH:MM:SS" display form, so lexicographic order is
+            // chronological. Files without capture time sort last.
+            let key =
+                |s: &FileSnapshot| (s.jpeg_exif_datetime.is_none(), s.jpeg_exif_datetime.clone());
+            key(a).cmp(&key(b)).then_with(|| path_cmp(a, b))
+        }),
+    }
+}
+
+/// Detects holes in numbered filename sequences over the proposed names.
+///
+/// Files are grouped by folder and by their proposed name with the *last*
+/// run of digits replaced by a marker. A group needs at least three members
+/// before a hole in its numeric range is reported, which keeps one-off names
+/// (a lone `notes2.txt`) from producing noise.
+struct SequenceGroup {
+    pattern: String,
+    width: usize,
+    numbers: Vec<u64>,
+}
+
+fn detect_sequence_gaps(actions: &[PlannedAction]) -> Vec<SequenceGap> {
+    use std::collections::BTreeMap;
+    // Keyed by (folder, masked stem, extension).
+    let mut groups: BTreeMap<(PathBuf, String, String), SequenceGroup> = BTreeMap::new();
+    for action in actions {
+        let name = &action.proposed_name;
+        let (stem, extension) = match name.rfind('.') {
+            Some(dot) if dot > 0 => (&name[..dot], &name[dot + 1..]),
+            _ => (name.as_str(), ""),
+        };
+        let bytes = stem.as_bytes();
+        // Find the last maximal run of ASCII digits in the stem.
+        let mut run: Option<(usize, usize)> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                run = Some((start, i));
+            } else {
+                i += 1;
+            }
+        }
+        let Some((start, end)) = run else {
+            continue;
+        };
+        let Ok(value) = stem[start..end].parse::<u64>() else {
+            continue;
+        };
+        let width = end - start;
+        // Group key: literal stem text around a single marker. Display
+        // pattern: the same text with one `#` per digit of the varying run.
+        let masked = format!("{}#{}", &stem[..start], &stem[end..]);
+        let mut pattern = format!("{}{}{}", &stem[..start], "#".repeat(width), &stem[end..]);
+        if !extension.is_empty() {
+            pattern.push_str(&format!(".{extension}"));
+        }
+        let folder = action
+            .destination
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let group = groups
+            .entry((folder, masked, extension.to_string()))
+            .or_insert_with(|| SequenceGroup {
+                pattern,
+                width,
+                numbers: Vec::new(),
+            });
+        group.numbers.push(value);
+    }
+
+    let mut gaps = Vec::new();
+    for ((folder, _masked, _extension), group) in groups {
+        let SequenceGroup {
+            pattern,
+            width,
+            mut numbers,
+        } = group;
+        if numbers.len() < 3 {
+            continue;
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
+        let (min, max) = (numbers[0], numbers[numbers.len() - 1]);
+        let span = max - min + 1;
+        let present = u64::try_from(numbers.len()).unwrap_or(u64::MAX);
+        if span <= present {
+            continue;
+        }
+        let present_set: std::collections::BTreeSet<u64> = numbers.iter().copied().collect();
+        let missing: Vec<u64> = (min..=max)
+            .filter(|value| !present_set.contains(value))
+            .take(20)
+            .collect();
+        gaps.push(SequenceGap {
+            pattern,
+            width,
+            folder,
+            present: numbers.len(),
+            missing_count: usize::try_from(span - present).unwrap_or(usize::MAX),
+            missing,
+        });
+    }
+    gaps
 }
 
 fn snapshot(path: &Path) -> Result<FileSnapshot, PlanIssue> {
@@ -473,5 +624,149 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.summary.discovered, 1);
+    }
+    fn fabricated_snapshot(
+        path: &str,
+        modified: Option<i128>,
+        capture: Option<&str>,
+    ) -> FileSnapshot {
+        FileSnapshot {
+            source: PathBuf::from(path),
+            original_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            is_directory: false,
+            fingerprint: FileFingerprint {
+                size_bytes: 1,
+                modified_unix_nanos: modified,
+            },
+            modified_unix_nanos: modified,
+            jpeg_exif_datetime: capture.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn name_sort_differs_from_path_sort() {
+        let mut snapshots = vec![
+            fabricated_snapshot("/root/zz/a.txt", None, None),
+            fabricated_snapshot("/root/aa/z.txt", None, None),
+        ];
+        sort_snapshots(&mut snapshots, SortOrder::Path);
+        assert_eq!(snapshots[0].original_name, "z.txt");
+        sort_snapshots(&mut snapshots, SortOrder::Name);
+        assert_eq!(snapshots[0].original_name, "a.txt");
+    }
+
+    #[test]
+    fn modified_sort_puts_oldest_first_and_unknown_last() {
+        let mut snapshots = vec![
+            fabricated_snapshot("/root/new.txt", Some(300), None),
+            fabricated_snapshot("/root/unknown.txt", None, None),
+            fabricated_snapshot("/root/old.txt", Some(100), None),
+        ];
+        sort_snapshots(&mut snapshots, SortOrder::ModifiedOldest);
+        let order: Vec<&str> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.original_name.as_str())
+            .collect();
+        assert_eq!(order, ["old.txt", "new.txt", "unknown.txt"]);
+    }
+
+    #[test]
+    fn capture_sort_puts_oldest_first_and_unknown_last() {
+        let mut snapshots = vec![
+            fabricated_snapshot("/root/late.jpg", None, Some("2026-06-01 10:00:00")),
+            fabricated_snapshot("/root/none.jpg", None, None),
+            fabricated_snapshot("/root/early.jpg", None, Some("2024-01-15 09:30:00")),
+        ];
+        sort_snapshots(&mut snapshots, SortOrder::CaptureDateOldest);
+        let order: Vec<&str> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.original_name.as_str())
+            .collect();
+        assert_eq!(order, ["early.jpg", "late.jpg", "none.jpg"]);
+    }
+
+    #[test]
+    fn counter_numbering_follows_the_chosen_sort() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("aa")).unwrap();
+        fs::create_dir(directory.path().join("zz")).unwrap();
+        fs::write(directory.path().join("aa/z.txt"), "z").unwrap();
+        fs::write(directory.path().join("zz/a.txt"), "a").unwrap();
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AppendCounter {
+                separator: "_".into(),
+                start_at: 1,
+                width: 4,
+            }],
+        };
+        let proposed_for = |planned: &PlannedJob, original: &str| {
+            planned
+                .actions
+                .iter()
+                .find(|action| action.snapshot.original_name == original)
+                .unwrap()
+                .proposed_name
+                .clone()
+        };
+
+        let mut by_path = PlanRequest::rename(vec![directory.path().to_path_buf()]);
+        by_path.recursive = true;
+        let planned = plan(by_path, &pipeline).unwrap();
+        assert_eq!(proposed_for(&planned, "z.txt"), "z_0001.txt");
+        assert_eq!(proposed_for(&planned, "a.txt"), "a_0002.txt");
+
+        let mut by_name = PlanRequest::rename(vec![directory.path().to_path_buf()]);
+        by_name.recursive = true;
+        by_name.sort = SortOrder::Name;
+        let planned = plan(by_name, &pipeline).unwrap();
+        assert_eq!(proposed_for(&planned, "a.txt"), "a_0001.txt");
+        assert_eq!(proposed_for(&planned, "z.txt"), "z_0002.txt");
+    }
+
+    #[test]
+    fn sequence_gap_is_detected_in_proposed_names() {
+        let directory = tempdir().unwrap();
+        for name in [
+            "IMG_0001.jpg",
+            "IMG_0002.jpg",
+            "IMG_0004.jpg",
+            "IMG_0007.jpg",
+        ] {
+            fs::write(directory.path().join(name), "x").unwrap();
+        }
+        let planned = plan(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &RulePipeline::default(),
+        )
+        .unwrap();
+        assert_eq!(planned.sequence_gaps.len(), 1);
+        let gap = &planned.sequence_gaps[0];
+        assert_eq!(gap.pattern, "IMG_####.jpg");
+        assert_eq!(gap.present, 4);
+        assert_eq!(gap.missing, vec![3, 5, 6]);
+        assert!(
+            planned
+                .global_issues
+                .iter()
+                .any(|issue| issue.kind == PlanIssueKind::SequenceGap
+                    && issue.severity == Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn complete_sequence_has_no_gap() {
+        let directory = tempdir().unwrap();
+        for name in ["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"] {
+            fs::write(directory.path().join(name), "x").unwrap();
+        }
+        // A lone pair with a hole is below the reporting threshold.
+        fs::write(directory.path().join("clip_01.mp4"), "x").unwrap();
+        fs::write(directory.path().join("clip_03.mp4"), "x").unwrap();
+        let planned = plan(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &RulePipeline::default(),
+        )
+        .unwrap();
+        assert!(planned.sequence_gaps.is_empty());
     }
 }
