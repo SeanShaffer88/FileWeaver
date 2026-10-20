@@ -110,7 +110,7 @@ ui/main.slint     Accessible desktop shell
 
 ## License
 
-This repository is licensed under **GNU GPL v2.0 only**. See [`LICENSE`](LICENSE).
+This repository is licensed under the **MIT License**. See [`LICENSE`](LICENSE).
 
 ## Research and design record
 
