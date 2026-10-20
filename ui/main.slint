@@ -1,0 +1,194 @@
+import { Button, CheckBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+export struct PreviewRow {
+    old_name: string,
+    proposed_name: string,
+    state: string,
+}
+
+export component MainWindow inherits Window {
+    title: "FileWeaver";
+    width: 1120px;
+    height: 760px;
+
+    in-out property <string> folder_path: "";
+    in-out property <string> prefix: "";
+    in-out property <string> find_text: "";
+    in-out property <string> replace_text: "";
+    in-out property <bool> add_counter: false;
+    in-out property <bool> recursive: false;
+    in-out property <bool> can_apply: false;
+    in-out property <string> status: "Choose a folder or paste its path, then select Scan to create a safe preview.";
+    in-out property <[PreviewRow]> rows: [];
+
+    callback scan_folder(string);
+    callback refresh_preview();
+    callback apply_changes();
+
+    background: #f7f8fa;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        Text {
+            text: "FileWeaver";
+            font-size: 26px;
+            font-weight: 700;
+            color: #172033;
+        }
+        Text {
+            text: "Preview, explain, and recover batch file changes locally.";
+            color: #4a5568;
+        }
+
+        Rectangle {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-width: 1px;
+            border-radius: 8px;
+            height: 92px;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: start;
+                    Text { text: "Folder to scan"; font-weight: 600; color: #172033; }
+                    LineEdit {
+                        text <=> root.folder_path;
+                        placeholder-text: "C:\\Users\\you\\Pictures";
+                        accessible-label: "Folder to scan";
+                        accessible-description: "Paste a folder path. The app scans it locally and does not change files until you apply a reviewed plan.";
+                    }
+                }
+                VerticalLayout {
+                    alignment: end;
+                    CheckBox {
+                        text: "Include subfolders";
+                        checked <=> root.recursive;
+                        accessible-description: "Include files in child folders. Leave this unchecked to review only the selected folder.";
+                    }
+                    Button {
+                        text: "Scan folder";
+                        primary: true;
+                        clicked => { root.scan_folder(root.folder_path); }
+                        accessible-description: "Create a non-destructive preview of files in the folder.";
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                width: 318px;
+                background: #ffffff;
+                border-color: #cbd5e1;
+                border-width: 1px;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+                    Text { text: "Build rules"; font-size: 18px; font-weight: 700; color: #172033; }
+                    Text { text: "Rules are applied in this order. The preview updates only when you select Refresh preview."; wrap: word-wrap; color: #4a5568; }
+                    Text { text: "Add prefix"; font-weight: 600; }
+                    LineEdit {
+                        text <=> root.prefix;
+                        placeholder-text: "Example: 2026-";
+                        accessible-label: "Add prefix";
+                        accessible-description: "Adds this text before every proposed filename.";
+                    }
+                    Text { text: "Find"; font-weight: 600; }
+                    LineEdit {
+                        text <=> root.find_text;
+                        placeholder-text: "Text to replace";
+                        accessible-label: "Find text";
+                        accessible-description: "Find literal text in each filename. Leave blank to make no replacement.";
+                    }
+                    Text { text: "Replace with"; font-weight: 600; }
+                    LineEdit {
+                        text <=> root.replace_text;
+                        placeholder-text: "Replacement text";
+                        accessible-label: "Replacement text";
+                        accessible-description: "Replacement for the Find text. An empty value removes matching text.";
+                    }
+                    CheckBox {
+                        text: "Append stable counter";
+                        checked <=> root.add_counter;
+                        accessible-description: "Append a four-digit number before the extension. Files are ordered by their full path, ignoring case.";
+                    }
+                    Button {
+                        text: "Refresh preview";
+                        clicked => { root.refresh_preview(); }
+                        accessible-description: "Recalculate the proposed names without changing files.";
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Text { text: "Advanced rules"; font-weight: 700; color: #172033; }
+                    Text { text: "Regex, capture-date tokens, saved templates, move/copy destinations, and mapping imports are implemented in the core design but are not exposed in this first UI slice."; wrap: word-wrap; color: #4a5568; }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                background: #ffffff;
+                border-color: #cbd5e1;
+                border-width: 1px;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    Text { text: "Preview"; font-size: 18px; font-weight: 700; color: #172033; }
+                    HorizontalLayout {
+                        Text { text: "Current name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
+                        Text { text: "Proposed name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
+                        Text { text: "Status"; width: 150px; font-weight: 700; color: #334155; }
+                    }
+                    Rectangle { height: 1px; background: #dbe3ee; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        for row in root.rows : Rectangle {
+                            height: 30px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: row.old_name; horizontal-stretch: 1; overflow: elide; }
+                                Text { text: row.proposed_name; horizontal-stretch: 1; overflow: elide; color: #0f5132; }
+                                Text { text: row.state; width: 150px; overflow: elide; color: #334155; }
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.status;
+                        wrap: word-wrap;
+                        color: #334155;
+                        accessible-label: "Status";
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-width: 1px;
+            border-radius: 8px;
+            height: 68px;
+            HorizontalLayout {
+                padding: 12px;
+                spacing: 12px;
+                Text {
+                    text: "Files are never changed by Scan or Refresh preview. Apply is enabled only when the plan has no blocking errors.";
+                    horizontal-stretch: 1;
+                    wrap: word-wrap;
+                    color: #334155;
+                }
+                Button {
+                    text: "Apply reviewed changes";
+                    primary: true;
+                    enabled: root.can_apply;
+                    clicked => { root.apply_changes(); }
+                    accessible-description: "Apply the reviewed plan. A durable local operation ledger records each completed file for later rollback.";
+                }
+            }
+        }
+    }
+}
