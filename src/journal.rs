@@ -1,8 +1,9 @@
 //! Durable local operation ledger.
 //!
-//! SQLite is used as an embedded, transactional implementation detail. User
-//! presets and reports remain JSON/CSV; the journal favors recoverability over
-//! hand editing.
+//! SQLite is used as an embedded, transactional implementation detail. The
+//! journal favors recoverability over hand editing. It records what was
+//! applied so a job can be reviewed against the current state of the disk
+//! and rolled back conservatively.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,21 @@ pub struct RollbackReport {
     pub restored: usize,
     pub removed_copies: usize,
     pub skipped: Vec<RollbackBlockedItem>,
+}
+
+/// A read-only summary of one recorded job, for history and recovery views.
+#[derive(Debug, Clone)]
+pub struct JobSummary {
+    pub id: i64,
+    pub started_unix_ms: i64,
+    pub completed_unix_ms: Option<i64>,
+    pub status: String,
+    pub message: Option<String>,
+    pub operation: crate::domain::OperationKind,
+    pub total_items: usize,
+    pub applied_items: usize,
+    pub failed_items: usize,
+    pub rolled_back_items: usize,
 }
 
 impl Journal {
@@ -228,6 +244,45 @@ impl Journal {
         Ok(items)
     }
 
+    /// Most recent jobs first, with per-status item counts, for history and
+    /// recovery views. Read-only: it never mutates the ledger.
+    pub fn list_jobs(&self, limit: usize) -> Result<Vec<JobSummary>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT j.id, j.started_unix_ms, j.completed_unix_ms, j.status, j.message,
+                    j.request_json,
+                    (SELECT COUNT(*) FROM job_items i WHERE i.job_id = j.id),
+                    (SELECT COUNT(*) FROM job_items i
+                      WHERE i.job_id = j.id AND i.status = 'applied'),
+                    (SELECT COUNT(*) FROM job_items i
+                      WHERE i.job_id = j.id AND i.status = 'failed'),
+                    (SELECT COUNT(*) FROM job_items i
+                      WHERE i.job_id = j.id AND i.status = 'rolled_back')
+             FROM jobs j ORDER BY j.id DESC LIMIT ?1",
+        )?;
+        let jobs = statement
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                let request_json: String = row.get(5)?;
+                let operation = serde_json::from_str::<crate::domain::PlanRequest>(&request_json)
+                    .map(|request| request.operation)
+                    .unwrap_or(crate::domain::OperationKind::Rename);
+                let count = |value: i64| usize::try_from(value).unwrap_or(0);
+                Ok(JobSummary {
+                    id: row.get(0)?,
+                    started_unix_ms: row.get(1)?,
+                    completed_unix_ms: row.get(2)?,
+                    status: row.get(3)?,
+                    message: row.get(4)?,
+                    operation,
+                    total_items: count(row.get(6)?),
+                    applied_items: count(row.get(7)?),
+                    failed_items: count(row.get(8)?),
+                    rolled_back_items: count(row.get(9)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(jobs)
+    }
+
     pub fn operation_kind(
         &self,
         job_id: i64,
@@ -331,5 +386,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(journal.applied_items(job).unwrap().len(), 1);
+    }
+    #[test]
+    fn list_jobs_summarizes_recorded_jobs() {
+        let directory = tempdir().unwrap();
+        let mut journal = Journal::open(directory.path().join("operations.sqlite")).unwrap();
+        let job = journal.create_job(&plan()).unwrap();
+        journal
+            .mark_applied(
+                job,
+                0,
+                &FileFingerprint {
+                    size_bytes: 2,
+                    modified_unix_nanos: Some(11),
+                },
+            )
+            .unwrap();
+        journal.finish_job(job, "completed", None).unwrap();
+        let jobs = journal.list_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job);
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(jobs[0].total_items, 1);
+        assert_eq!(jobs[0].applied_items, 1);
+        assert_eq!(jobs[0].failed_items, 0);
+        assert!(matches!(jobs[0].operation, OperationKind::Rename));
+        assert!(journal.list_jobs(0).unwrap().is_empty());
     }
 }

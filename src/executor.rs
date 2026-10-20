@@ -46,6 +46,51 @@ pub enum ExecuteError {
     UnsupportedDirectory(PathBuf),
 }
 
+/// How one applied item compares with the state recorded when its job ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divergence {
+    /// The destination still has the recorded post-operation fingerprint.
+    Intact,
+    /// The destination exists but its size or modification time changed.
+    Changed,
+    /// The destination can no longer be read (moved away or deleted).
+    Missing,
+}
+
+#[derive(Debug, Clone)]
+pub struct ItemReview {
+    pub item: AppliedItem,
+    pub divergence: Divergence,
+    /// For rename/move jobs: something else now sits at the original path,
+    /// so a rollback of this item would be skipped rather than overwrite it.
+    pub original_occupied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobReview {
+    pub job_id: i64,
+    pub operation: OperationKind,
+    pub items: Vec<ItemReview>,
+}
+
+impl JobReview {
+    pub fn count(&self, divergence: Divergence) -> usize {
+        self.items
+            .iter()
+            .filter(|review| review.divergence == divergence)
+            .count()
+    }
+
+    /// Items a rollback could act on right now: unchanged files whose
+    /// original location (for rename/move) is still free.
+    pub fn safely_reversible(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|review| review.divergence == Divergence::Intact && !review.original_occupied)
+            .count()
+    }
+}
+
 pub struct Executor {
     journal: Journal,
 }
@@ -252,6 +297,38 @@ impl Executor {
             }
         }
         Ok(report)
+    }
+
+    /// Compares every applied item of a job with the current disk state,
+    /// using the same conservative fingerprint check rollback performs.
+    /// Read-only: nothing on disk or in the journal changes.
+    pub fn review(&self, job_id: i64) -> Result<JobReview, ExecuteError> {
+        let operation = self.journal.operation_kind(job_id)?;
+        let applied = self.journal.applied_items(job_id)?;
+        let items = applied
+            .into_iter()
+            .map(|item| {
+                let divergence = match fingerprint(&item.destination) {
+                    Ok(actual) if actual == item.result_fingerprint => Divergence::Intact,
+                    Ok(_) => Divergence::Changed,
+                    Err(_) => Divergence::Missing,
+                };
+                let original_occupied =
+                    matches!(operation, OperationKind::Rename | OperationKind::Move)
+                        && item.source.exists()
+                        && path_key(&item.source) != path_key(&item.destination);
+                ItemReview {
+                    item,
+                    divergence,
+                    original_occupied,
+                }
+            })
+            .collect();
+        Ok(JobReview {
+            job_id,
+            operation,
+            items,
+        })
     }
 }
 
@@ -597,5 +674,47 @@ mod tests {
             fs::read_to_string(directory.path().join("b.txt")).unwrap(),
             "B"
         );
+    }
+    #[test]
+    fn review_reports_intact_changed_and_missing_items() {
+        use crate::rules::{Rule, RulePipeline};
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("b.txt"), b"b").unwrap();
+        fs::write(root.join("c.txt"), b"c").unwrap();
+        let request = PlanRequest {
+            inputs: vec![root.to_path_buf()],
+            operation: OperationKind::Rename,
+            destination_root: None,
+            recursive: false,
+            include_directories: false,
+            collision_policy: CollisionPolicy::Block,
+            allow_legacy_long_paths: false,
+        };
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x-".into() }],
+        };
+        let planned = crate::planner::plan(request, &pipeline).unwrap();
+        let journal = Journal::open(root.join("operations.sqlite")).unwrap();
+        let mut executor = Executor::new(journal);
+        let outcome = executor
+            .execute(&planned, &CancellationToken::default(), |_| {})
+            .unwrap();
+
+        let review = executor.review(outcome.job_id).unwrap();
+        assert_eq!(review.count(Divergence::Intact), 3);
+        assert_eq!(review.safely_reversible(), 3);
+
+        fs::write(root.join("x-a.txt"), b"a-much-longer-content").unwrap();
+        fs::remove_file(root.join("x-b.txt")).unwrap();
+        fs::write(root.join("c.txt"), b"intruder").unwrap();
+
+        let review = executor.review(outcome.job_id).unwrap();
+        assert_eq!(review.count(Divergence::Changed), 1);
+        assert_eq!(review.count(Divergence::Missing), 1);
+        assert_eq!(review.count(Divergence::Intact), 1);
+        // The one intact file's original location is occupied again.
+        assert_eq!(review.safely_reversible(), 0);
     }
 }

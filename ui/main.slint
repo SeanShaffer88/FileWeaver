@@ -6,10 +6,15 @@ export struct PreviewRow {
     state: string,
 }
 
+export struct LedgerRow {
+    heading: string,
+    detail: string,
+}
+
 export component MainWindow inherits Window {
     title: "FileWeaver";
     width: 1120px;
-    height: 760px;
+    height: 920px;
 
     in-out property <string> folder_path: "";
     in-out property <string> prefix: "";
@@ -22,12 +27,20 @@ export component MainWindow inherits Window {
     in-out property <string> risk_budget: "";
     in-out property <string> status: "Choose a folder or paste its path, then select Scan to create a safe preview.";
     in-out property <[PreviewRow]> rows: [];
+    in-out property <[LedgerRow]> ledger_rows: [];
+    in-out property <int> selected_job_index: -1;
+    in-out property <string> ledger_detail: "Select Refresh history to load recorded jobs.";
+    in-out property <bool> can_rollback: false;
+    in-out property <bool> confirming_rollback: false;
 
     callback scan_folder(string);
     callback refresh_preview();
     callback apply_changes();
     callback stop_apply();
     callback inputs_changed();
+    callback refresh_ledger();
+    callback select_job(int);
+    callback rollback_selected();
 
     background: #f7f8fa;
 
@@ -86,6 +99,7 @@ export component MainWindow inherits Window {
 
         HorizontalLayout {
             spacing: 12px;
+            vertical-stretch: 1;
             Rectangle {
                 width: 318px;
                 background: #ffffff;
@@ -177,6 +191,58 @@ export component MainWindow inherits Window {
                         wrap: word-wrap;
                         color: #334155;
                         accessible-label: "Status";
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-width: 1px;
+            border-radius: 8px;
+            height: 196px;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { text: "Recovery ledger"; font-size: 18px; font-weight: 700; color: #172033; horizontal-stretch: 1; }
+                    Button {
+                        text: "Refresh history";
+                        clicked => { root.refresh_ledger(); }
+                        accessible-description: "Reload the list of recorded jobs from the local operation ledger.";
+                    }
+                }
+                ScrollView {
+                    height: 62px;
+                    VerticalLayout {
+                        for row[idx] in root.ledger_rows : Rectangle {
+                            height: 30px;
+                            background: idx == root.selected_job_index ? #e2e8f0 : transparent;
+                            TouchArea { clicked => { root.select_job(idx); } }
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                spacing: 10px;
+                                Text { text: row.heading; font-weight: 600; color: #172033; }
+                                Text { text: row.detail; color: #4a5568; horizontal-stretch: 1; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: root.ledger_detail;
+                    wrap: word-wrap;
+                    color: #334155;
+                    accessible-label: "Recovery review";
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: root.confirming_rollback ? "Click again to confirm rollback" : "Roll back selected job";
+                        enabled: root.can_rollback && !root.applying;
+                        clicked => { root.rollback_selected(); }
+                        accessible-description: "Reverse the selected job for files that are unchanged since it ran. Changed or missing files are never overwritten.";
                     }
                 }
             }
