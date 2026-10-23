@@ -1,4 +1,4 @@
-# FileWeaver — agent notes
+# FilenameWeaver — agent notes
 
 ---
 

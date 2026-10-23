@@ -1,4 +1,4 @@
-//! Core services for FileWeaver.
+//! Core services for FilenameWeaver.
 //!
 //! The crate deliberately separates planning from filesystem mutation. A plan
 //! can be inspected and tested without changing a file. Execution accepts
@@ -9,8 +9,10 @@ pub mod domain;
 pub mod executor;
 pub mod handoff;
 pub mod journal;
+pub mod mapping;
 pub mod metadata;
 pub mod planner;
+pub mod presets;
 pub mod rules;
 
 pub use domain::{
@@ -22,5 +24,12 @@ pub use executor::{
 };
 pub use handoff::{DriftReport, DriftState, HandoffAction, HandoffError, PlanFile, RowDrift};
 pub use journal::{JobSummary, Journal, JournalError, RollbackReport};
-pub use planner::{PlanError, plan, subset_plan};
-pub use rules::{Rule, RulePipeline, RuleProblem};
+pub use mapping::{
+    MappingEntry, MappingError, MappingImport, mapping_pipeline_marker, parse_mapping_csv,
+};
+pub use planner::{PlanError, plan, plan_from_mapping, subset_plan};
+pub use presets::{
+    PRESET_FORMAT, PRESET_FORMAT_VERSION, PresetError, PresetFile, PresetListing, PresetStore,
+    PresetSummary,
+};
+pub use rules::{CaseStyle, DateSource, Rule, RulePipeline, RuleProblem};

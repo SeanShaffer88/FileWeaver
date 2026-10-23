@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use crate::domain::{
     CollisionPolicy, FileFingerprint, FileSnapshot, OperationKind, PlanIssue, PlanIssueKind,
     PlanRequest, PlanSummary, PlannedAction, PlannedJob, SequenceGap, Severity, SortOrder,
+    StageValue,
 };
 use crate::metadata;
 use crate::rules::{RulePipeline, RuleProblem};
@@ -48,7 +49,7 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
 
     let mut actions = Vec::with_capacity(snapshots.len());
     for (index, snapshot) in snapshots.into_iter().enumerate() {
-        let (proposed_name, stages, mut issues) = if pipeline_is_valid {
+        let (proposed_name, stages, issues) = if pipeline_is_valid {
             match pipeline.apply(&snapshot, index) {
                 Ok((name, stages)) => (name, stages, Vec::new()),
                 Err(problem) => (
@@ -68,32 +69,14 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
             )
         };
 
-        issues.extend(validate_filename_component(&proposed_name));
-        let destination = destination_for(&request, &snapshot.source, &proposed_name);
-        if !request.allow_legacy_long_paths && legacy_path_length(&destination) > 259 {
-            issues.push(PlanIssue::error(
-                PlanIssueKind::LegacyPathTooLong,
-                format!(
-                    "The proposed path is {} UTF-16 code units long. It exceeds the conservative 259-character limit.",
-                    legacy_path_length(&destination)
-                ),
-            ));
-        }
-        if snapshot.source == destination {
-            issues.push(PlanIssue::info(
-                PlanIssueKind::NoChange,
-                "The rule produces the current name and location.",
-            ));
-        }
-
-        actions.push(PlannedAction {
+        actions.push(build_action(
+            &request,
             index,
             snapshot,
-            destination,
             proposed_name,
             stages,
             issues,
-        });
+        ));
     }
 
     apply_collision_validation(&mut actions, request.collision_policy);
@@ -107,6 +90,171 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
     Ok(PlannedJob {
         request,
         pipeline_json: serde_json::to_string_pretty(pipeline)?,
+        global_issues,
+        actions,
+        summary,
+        sequence_gaps,
+    })
+}
+
+/// Builds one validated action: filename rules, the legacy path-length
+/// guard, and the no-change marker are identical no matter where the
+/// proposed name came from (rules or an imported mapping).
+fn build_action(
+    request: &PlanRequest,
+    index: usize,
+    snapshot: FileSnapshot,
+    proposed_name: String,
+    stages: Vec<StageValue>,
+    mut issues: Vec<PlanIssue>,
+) -> PlannedAction {
+    issues.extend(validate_filename_component(&proposed_name));
+    let destination = destination_for(request, &snapshot.source, &proposed_name);
+    if !request.allow_legacy_long_paths && legacy_path_length(&destination) > 259 {
+        issues.push(PlanIssue::error(
+            PlanIssueKind::LegacyPathTooLong,
+            format!(
+                "The proposed path is {} UTF-16 code units long. It exceeds the conservative 259-character limit.",
+                legacy_path_length(&destination)
+            ),
+        ));
+    }
+    if snapshot.source == destination {
+        issues.push(PlanIssue::info(
+            PlanIssueKind::NoChange,
+            "The proposed name is the current name and location.",
+        ));
+    }
+    PlannedAction {
+        index,
+        snapshot,
+        destination,
+        proposed_name,
+        stages,
+        issues,
+    }
+}
+
+/// Produces a plan from an explicit current-name → proposed-name mapping
+/// (see [`crate::mapping`]) instead of from rules. Matching is by exact
+/// current file name. Files with no entry keep their name and carry a
+/// warning so they are visibly unmapped rather than silently skipped;
+/// entries that match no scanned file, and names that occur more than
+/// once in the scan (where one entry would rename several files), are
+/// reported for the same reason. All filename, collision, and summary
+/// validation is the same as for a rule-based plan, so a mapping plan can
+/// be reviewed, excluded per row, handed off, and applied through exactly
+/// the same safeguards.
+pub fn plan_from_mapping(
+    request: PlanRequest,
+    entries: &[(String, String)],
+) -> Result<PlannedJob, PlanError> {
+    let mut global_issues = Vec::new();
+    if entries.is_empty() {
+        global_issues.push(PlanIssue::error(
+            PlanIssueKind::MappingProblem,
+            "The mapping contained no usable name pairs, so nothing can be renamed from it.",
+        ));
+    }
+    if matches!(request.operation, OperationKind::Copy | OperationKind::Move)
+        && request.destination_root.is_none()
+    {
+        global_issues.push(PlanIssue::error(
+            PlanIssueKind::MissingDestinationRoot,
+            "Copy and move plans need a destination folder.",
+        ));
+    }
+
+    let (snapshots, scan_issues) = collect_snapshots(&request);
+    global_issues.extend(scan_issues);
+
+    let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for snapshot in &snapshots {
+        *name_counts
+            .entry(snapshot.original_name.as_str())
+            .or_default() += 1;
+    }
+    let matched: BTreeSet<&str> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.original_name.as_str())
+        .collect();
+    let unmatched: Vec<&str> = entries
+        .iter()
+        .map(|(current, _)| current.as_str())
+        .filter(|current| !matched.contains(current))
+        .collect();
+    if !unmatched.is_empty() {
+        let shown: Vec<&str> = unmatched.iter().take(5).copied().collect();
+        global_issues.push(PlanIssue::warning(
+            PlanIssueKind::MappingProblem,
+            format!(
+                "{} mapping entr{} matched no scanned file ({}). Those rows change nothing.",
+                unmatched.len(),
+                if unmatched.len() == 1 { "y" } else { "ies" },
+                shown.join(", ")
+            ),
+        ));
+    }
+
+    let mut actions = Vec::with_capacity(snapshots.len());
+    for (index, snapshot) in snapshots.into_iter().enumerate() {
+        let mut issues = Vec::new();
+        let (proposed_name, stages) = match entries
+            .iter()
+            .find(|(current, _)| current == &snapshot.original_name)
+        {
+            Some((_, proposed)) => {
+                let occurrences = name_counts
+                    .get(snapshot.original_name.as_str())
+                    .copied()
+                    .unwrap_or(1);
+                if occurrences > 1 {
+                    issues.push(PlanIssue::warning(
+                            PlanIssueKind::MappingProblem,
+                            format!(
+                                "\"{}\" appears {occurrences} times in this scan; this one mapping entry renames every one of them. Review each row before applying.",
+                                snapshot.original_name
+                            ),
+                        ));
+                }
+                (
+                    proposed.clone(),
+                    vec![StageValue {
+                        rule_label: "Mapping import".to_string(),
+                        value: proposed.clone(),
+                    }],
+                )
+            }
+            None => {
+                issues.push(PlanIssue::warning(
+                    PlanIssueKind::MappingProblem,
+                    format!(
+                        "No mapping entry for \"{}\"; it keeps its current name.",
+                        snapshot.original_name
+                    ),
+                ));
+                (snapshot.original_name.clone(), Vec::new())
+            }
+        };
+        actions.push(build_action(
+            &request,
+            index,
+            snapshot,
+            proposed_name,
+            stages,
+            issues,
+        ));
+    }
+
+    apply_collision_validation(&mut actions, request.collision_policy);
+    let sequence_gaps = detect_sequence_gaps(&actions);
+    for gap in &sequence_gaps {
+        global_issues.push(sequence_gap_issue(gap));
+    }
+    let summary = summarize(&actions, &global_issues);
+    Ok(PlannedJob {
+        request,
+        pipeline_json: crate::mapping::mapping_pipeline_marker(entries),
         global_issues,
         actions,
         summary,
@@ -461,7 +609,7 @@ fn apply_collision_validation(actions: &mut [PlannedAction], policy: CollisionPo
             action.issues.push(PlanIssue::error(
                 PlanIssueKind::ExistingTarget,
                 format!(
-                    "{} already exists and FileWeaver will not overwrite it.",
+                    "{} already exists and FilenameWeaver will not overwrite it.",
                     action.destination.display()
                 ),
             ));
@@ -808,5 +956,123 @@ mod tests {
         )
         .unwrap();
         assert!(planned.sequence_gaps.is_empty());
+    }
+
+    #[test]
+    fn mapping_plan_renames_mapped_and_warns_about_unmapped() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        fs::write(directory.path().join("b.txt"), "b").unwrap();
+        let entries = vec![("a.txt".to_string(), "renamed-a.txt".to_string())];
+        let planned = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(planned.summary.discovered, 2);
+        assert_eq!(planned.summary.ready, 1);
+        assert!(planned.is_executable());
+        assert_eq!(
+            planned.pipeline_json,
+            crate::mapping::mapping_pipeline_marker(&entries)
+        );
+        let a = &planned.actions[0];
+        assert_eq!(a.proposed_name, "renamed-a.txt");
+        assert_eq!(a.stages.len(), 1);
+        assert_eq!(a.stages[0].rule_label, "Mapping import");
+        let b = &planned.actions[1];
+        assert!(!b.will_change());
+        assert!(b.issues.iter().any(|issue| {
+            issue.kind == PlanIssueKind::MappingProblem && issue.severity == Severity::Warning
+        }));
+    }
+
+    #[test]
+    fn mapping_plan_allows_a_name_swap() {
+        // Swapping two names in one batch is legitimate: each target is a
+        // source in the same plan, and the executor stages same-volume
+        // cycles. Collision validation must not block it.
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        fs::write(directory.path().join("b.txt"), "b").unwrap();
+        let entries = vec![
+            ("a.txt".to_string(), "b.txt".to_string()),
+            ("b.txt".to_string(), "a.txt".to_string()),
+        ];
+        let planned = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(planned.summary.ready, 2);
+        assert!(planned.is_executable());
+    }
+
+    #[test]
+    fn mapping_plan_blocks_duplicate_and_invalid_targets() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        fs::write(directory.path().join("b.txt"), "b").unwrap();
+        let entries = vec![
+            ("a.txt".to_string(), "same.txt".to_string()),
+            ("b.txt".to_string(), "same.txt".to_string()),
+        ];
+        let planned = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(planned.summary.blocking_errors, 2);
+        assert!(!planned.is_executable());
+
+        let invalid = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &[("a.txt".to_string(), "bad:name.txt".to_string())],
+        )
+        .unwrap();
+        assert!(
+            invalid.actions[0]
+                .issues
+                .iter()
+                .any(|issue| issue.kind == PlanIssueKind::InvalidCharacter)
+        );
+        assert!(!invalid.is_executable());
+    }
+
+    #[test]
+    fn mapping_plan_reports_entries_that_match_nothing() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        let planned = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &[
+                ("a.txt".to_string(), "b.txt".to_string()),
+                ("ghost.txt".to_string(), "c.txt".to_string()),
+            ],
+        )
+        .unwrap();
+        assert!(planned.global_issues.iter().any(|issue| {
+            issue.kind == PlanIssueKind::MappingProblem && issue.message.contains("ghost.txt")
+        }));
+        // A warning, not a blocker: the matched row can still be applied.
+        assert!(planned.is_executable());
+    }
+
+    #[test]
+    fn empty_mapping_is_a_blocking_problem() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        let planned = plan_from_mapping(
+            PlanRequest::rename(vec![directory.path().to_path_buf()]),
+            &[],
+        )
+        .unwrap();
+        assert!(!planned.is_executable());
+        assert!(
+            planned
+                .global_issues
+                .iter()
+                .any(|issue| issue.severity == Severity::Error)
+        );
     }
 }

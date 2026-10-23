@@ -1,9 +1,17 @@
-import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ProgressIndicator, ScrollView, SpinBox, VerticalBox } from "std-widgets.slint";
 
 export struct PreviewRow {
+    plan_index: int,
     old_name: string,
     proposed_name: string,
     state: string,
+    included: bool,
+}
+
+export struct RuleRow {
+    position: string,
+    label: string,
+    summary: string,
 }
 
 export struct LedgerRow {
@@ -11,16 +19,18 @@ export struct LedgerRow {
     detail: string,
 }
 
-export component MainWindow inherits Window {
-    title: "FileWeaver";
-    width: 1120px;
-    height: 920px;
+export struct HandoffRow {
+    name: string,
+    state: string,
+    detail: string,
+}
+
+component MainWindow inherits Window {
+    title: "FilenameWeaver";
+    width: 1280px;
+    height: 1160px;
 
     in-out property <string> folder_path: "";
-    in-out property <string> prefix: "";
-    in-out property <string> find_text: "";
-    in-out property <string> replace_text: "";
-    in-out property <bool> add_counter: false;
     in-out property <bool> recursive: false;
     in-out property <bool> can_apply: false;
     in-out property <bool> applying: false;
@@ -31,6 +41,54 @@ export component MainWindow inherits Window {
     in-out property <[PreviewRow]> rows: [];
     in-out property <int> selected_row_index: -1;
     in-out property <string> provenance: "";
+    // Preview filter and list export. Filtering is a view concern only.
+    in-out property <int> filter_index: 0;
+    in-out property <string> filter_summary: "";
+    // On-screen row order. View-only: plan order, counter numbering, and
+    // Apply behavior never change with it.
+    in-out property <int> preview_sort_index: 0;
+    // Job progress, 0.0–1.0, driven by executor progress events.
+    in-out property <float> progress_value: 0.0;
+    // Mapping import: explicit current_name,proposed_name CSV rows.
+    in-out property <string> mapping_path: "";
+    in-out property <string> mapping_detail: "Import a CSV with current_name,proposed_name rows to rename by explicit list instead of rules. Export list writes this format, so you can export, edit in a spreadsheet, and import back. Files with no row keep their name and are marked for review.";
+    in-out property <string> export_path: "";
+
+    // Ordered rule stack. The list is authored in the shell and converted to
+    // the core rule pipeline; the preview always reflects this exact order.
+    in-out property <[RuleRow]> rule_rows: [];
+    in-out property <int> selected_rule_index: -1;
+    in-out property <int> new_rule_kind: 0;
+    in-out property <int> editor_kind: -1;
+    in-out property <string> editor_text: "";
+    in-out property <string> editor_find: "";
+    in-out property <string> editor_replacement: "";
+    in-out property <bool> editor_replace_all: false;
+    in-out property <int> editor_case_index: 0;
+    in-out property <string> editor_extension: "";
+    in-out property <int> editor_date_source_index: 0;
+    in-out property <string> editor_date_format: "[year]-[month]-[day]";
+    in-out property <string> editor_date_separator: "_";
+    in-out property <string> editor_counter_separator: "_";
+    in-out property <int> editor_counter_start: 1;
+    in-out property <int> editor_counter_width: 4;
+    in-out property <string> editor_hint: "";
+
+    // Named rule-stack presets, stored as versioned JSON files beside the
+    // operation ledger. The combo box indexes the loaded list.
+    in-out property <[string]> preset_names: [];
+    in-out property <int> preset_index: -1;
+    in-out property <string> preset_name: "";
+    in-out property <string> preset_detail: "No saved presets yet.";
+    in-out property <bool> confirming_preset_delete: false;
+
+    // Plan handoff: one portable file records the plan; opening it revalidates
+    // every row against the folder as it exists now.
+    in-out property <string> plan_path: "";
+    in-out property <string> handoff_detail: "Save plan writes this reviewed plan to a portable JSON file. Opening a plan re-checks every row against the folder before anything is applied.";
+    in-out property <[HandoffRow]> handoff_rows: [];
+    in-out property <bool> can_apply_handoff: false;
+
     in-out property <[LedgerRow]> ledger_rows: [];
     in-out property <int> selected_job_index: -1;
     in-out property <string> ledger_detail: "Select Refresh history to load recorded jobs.";
@@ -42,10 +100,27 @@ export component MainWindow inherits Window {
     callback apply_changes();
     callback stop_apply();
     callback inputs_changed();
+    callback add_rule(int);
+    callback remove_rule();
+    callback move_rule_up();
+    callback move_rule_down();
+    callback select_rule(int);
+    callback editor_changed();
+    callback save_preset();
+    callback load_preset();
+    callback delete_preset();
+    callback save_plan();
+    callback open_plan();
+    callback apply_handoff();
     callback refresh_ledger();
     callback select_job(int);
     callback rollback_selected();
     callback select_row(int);
+    callback filter_changed(int);
+    callback preview_sort_changed(int);
+    callback import_mapping();
+    callback export_rows();
+    callback toggle_row(int);
 
     background: #f7f8fa;
 
@@ -54,13 +129,13 @@ export component MainWindow inherits Window {
         spacing: 12px;
 
         Text {
-            text: "FileWeaver";
+            text: "FilenameWeaver";
             font-size: 26px;
             font-weight: 700;
             color: #172033;
         }
         Text {
-            text: "Preview, explain, and recover batch file changes locally.";
+            text: "A local-first batch renamer: build an ordered rule stack, preview every name, apply only what you reviewed.";
             color: #4a5568;
         }
 
@@ -105,41 +180,95 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             spacing: 12px;
             vertical-stretch: 1;
+
             Rectangle {
-                width: 318px;
+                width: 300px;
                 background: #ffffff;
                 border-color: #cbd5e1;
                 border-width: 1px;
                 border-radius: 8px;
                 VerticalLayout {
                     padding: 14px;
-                    spacing: 10px;
-                    Text { text: "Build rules"; font-size: 18px; font-weight: 700; color: #172033; }
-                    Text { text: "Rules are applied in this order. The preview updates only when you select Refresh preview."; wrap: word-wrap; color: #4a5568; }
-                    Text { text: "Add prefix"; font-weight: 600; }
-                    LineEdit {
-                        text <=> root.prefix;
-                        placeholder-text: "Example: 2026-";
-                        edited => { root.inputs_changed(); }
-                        accessible-label: "Add prefix";
-                        accessible-description: "Adds this text before every proposed filename.";
+                    spacing: 8px;
+                    Text { text: "Rules"; font-size: 18px; font-weight: 700; color: #172033; }
+                    Text {
+                        text: "Rules run from top to bottom. The preview shows each step’s result, so check the order before applying.";
+                        wrap: word-wrap;
+                        color: #4a5568;
                     }
-                    Text { text: "Find"; font-weight: 600; }
-                    LineEdit {
-                        text <=> root.find_text;
-                        placeholder-text: "Text to replace";
-                        edited => { root.inputs_changed(); }
-                        accessible-label: "Find text";
-                        accessible-description: "Find literal text in each filename. Leave blank to make no replacement.";
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 2px;
+                            if root.rule_rows.length == 0 : Text {
+                                text: "No rules yet. Add a rule below, or scan to preview the untouched names.";
+                                wrap: word-wrap;
+                                color: #4a5568;
+                            }
+                            for rule[idx] in root.rule_rows : Rectangle {
+                                height: 30px;
+                                background: idx == root.selected_rule_index ? #e2e8f0 : transparent;
+                                border-radius: 4px;
+                                TouchArea { clicked => { root.select_rule(idx); } }
+                                HorizontalLayout {
+                                    padding-left: 6px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: rule.position;
+                                        width: 20px;
+                                        font-weight: 700;
+                                        color: #475569;
+                                        accessible-label: "Rule position";
+                                    }
+                                    Text {
+                                        text: rule.label + " — " + rule.summary;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                        color: #172033;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    Text { text: "Replace with"; font-weight: 600; }
-                    LineEdit {
-                        text <=> root.replace_text;
-                        placeholder-text: "Replacement text";
-                        edited => { root.inputs_changed(); }
-                        accessible-label: "Replacement text";
-                        accessible-description: "Replacement for the Find text. An empty value removes matching text.";
+                    HorizontalLayout {
+                        spacing: 6px;
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            model: ["Add prefix", "Add suffix", "Replace text", "Replace regex", "Change case", "Trim whitespace", "Change extension", "Add date prefix", "Append counter"];
+                            current-index <=> root.new_rule_kind;
+                            accessible-label: "Rule type to add";
+                            accessible-description: "Choose the kind of rule to append to the rule stack.";
+                        }
+                        Button {
+                            text: "Add";
+                            clicked => { root.add_rule(root.new_rule_kind); }
+                            accessible-description: "Append the chosen rule to the end of the rule stack.";
+                        }
                     }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: "Up";
+                            enabled: root.selected_rule_index > 0;
+                            clicked => { root.move_rule_up(); }
+                            accessible-label: "Move rule up";
+                            accessible-description: "Move the selected rule earlier in the stack.";
+                        }
+                        Button {
+                            text: "Down";
+                            enabled: root.selected_rule_index >= 0 && root.selected_rule_index < root.rule_rows.length - 1;
+                            clicked => { root.move_rule_down(); }
+                            accessible-label: "Move rule down";
+                            accessible-description: "Move the selected rule later in the stack.";
+                        }
+                        Button {
+                            text: "Remove";
+                            enabled: root.selected_rule_index >= 0;
+                            clicked => { root.remove_rule(); }
+                            accessible-description: "Remove the selected rule from the stack.";
+                        }
+                    }
+                    Rectangle { height: 1px; background: #dbe3ee; }
                     Text { text: "Numbering order"; font-weight: 600; }
                     ComboBox {
                         model: ["Path (A–Z)", "Name (A–Z)", "Modified (oldest first)", "Capture date (oldest first)"];
@@ -148,20 +277,229 @@ export component MainWindow inherits Window {
                         accessible-label: "Numbering order";
                         accessible-description: "The order files are numbered and processed in. Capture date uses JPEG Exif capture time; files without one go last.";
                     }
-                    CheckBox {
-                        text: "Append stable counter";
-                        checked <=> root.add_counter;
-                        toggled => { root.inputs_changed(); }
-                        accessible-description: "Append a four-digit number before the extension, assigned in the numbering order selected above.";
-                    }
                     Button {
                         text: "Refresh preview";
                         clicked => { root.refresh_preview(); }
                         accessible-description: "Recalculate the proposed names without changing files.";
                     }
-                    Rectangle { vertical-stretch: 1; }
-                    Text { text: "Advanced rules"; font-weight: 700; color: #172033; }
-                    Text { text: "Regex and capture-date rules exist in the core library but are not exposed in this first UI slice. Saved templates and mapping imports are not implemented yet."; wrap: word-wrap; color: #4a5568; }
+                    Rectangle { height: 1px; background: #dbe3ee; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            model: root.preset_names;
+                            current-index <=> root.preset_index;
+                            selected => { root.confirming_preset_delete = false; }
+                            accessible-label: "Saved presets";
+                            accessible-description: "Rule-stack presets saved on this computer. Select a preset, then Load to replace the rule stack or Delete to remove the saved preset.";
+                        }
+                        Button {
+                            text: "Load";
+                            enabled: root.preset_index >= 0;
+                            clicked => { root.load_preset(); }
+                            accessible-description: "Replace the current rule stack with the selected preset. Nothing is applied to files.";
+                        }
+                        Button {
+                            text: root.confirming_preset_delete ? "Confirm" : "Delete";
+                            enabled: root.preset_index >= 0;
+                            clicked => { root.delete_preset(); }
+                            accessible-label: "Delete preset";
+                            accessible-description: "Remove the selected saved preset after a confirmation. The current rule stack is unchanged.";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text <=> root.preset_name;
+                            placeholder-text: "Preset name";
+                            accessible-label: "Preset name";
+                            accessible-description: "Name for the current rule stack when you save it as a preset.";
+                        }
+                        Button {
+                            text: "Save preset";
+                            clicked => { root.save_preset(); }
+                            accessible-description: "Save the current ordered rule stack under this name as a reusable preset.";
+                        }
+                    }
+                    Text {
+                        text: root.preset_detail;
+                        wrap: word-wrap;
+                        color: #4a5568;
+                        accessible-label: "Preset status";
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 300px;
+                background: #ffffff;
+                border-color: #cbd5e1;
+                border-width: 1px;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    Text { text: "Rule settings"; font-size: 18px; font-weight: 700; color: #172033; }
+                    Text {
+                        text: root.editor_kind >= 0 ? "Editing rule " + (root.selected_rule_index + 1) + ". Changes apply to the preview after you refresh it." : "Select a rule in the list to edit its settings.";
+                        wrap: word-wrap;
+                        color: #4a5568;
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 6px;
+                            if root.editor_kind == 0 || root.editor_kind == 1 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Text"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_text;
+                                    placeholder-text: "Example: 2026-";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Rule text";
+                                    accessible-description: "Text this rule adds. Blank text changes nothing.";
+                                }
+                                Text {
+                                    text: root.editor_kind == 0 ? "Added at the start of each name." : "Inserted before the final extension.";
+                                    wrap: word-wrap;
+                                    color: #4a5568;
+                                }
+                            }
+                            if root.editor_kind == 2 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Find (literal text)"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_find;
+                                    placeholder-text: "Text to find";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Find text";
+                                    accessible-description: "Literal text this rule finds in each name.";
+                                }
+                                Text { text: "Replace with"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_replacement;
+                                    placeholder-text: "Replacement (blank deletes the match)";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Replacement text";
+                                    accessible-description: "Text that replaces the match. Leave blank to remove the matched text.";
+                                }
+                                CheckBox {
+                                    text: "Replace every occurrence";
+                                    checked <=> root.editor_replace_all;
+                                    toggled => { root.editor_changed(); }
+                                    accessible-description: "When unchecked, only the first match in each name is replaced.";
+                                }
+                            }
+                            if root.editor_kind == 3 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Pattern (regular expression)"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_find;
+                                    placeholder-text: "^(\\d{4})-(\\d{2})-";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Regular expression pattern";
+                                    accessible-description: "A Rust regular expression matched against each name. An invalid pattern blocks Apply and is explained in the preview.";
+                                }
+                                Text { text: "Replace with"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_replacement;
+                                    placeholder-text: "$1_$2_ (capture groups allowed)";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Regex replacement";
+                                    accessible-description: "Replacement text. Capture groups such as $1 are supported.";
+                                }
+                            }
+                            if root.editor_kind == 4 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Case style"; font-weight: 600; }
+                                ComboBox {
+                                    model: ["lowercase", "UPPERCASE", "Title Case"];
+                                    current-index <=> root.editor_case_index;
+                                    selected => { root.editor_changed(); }
+                                    accessible-label: "Case style";
+                                    accessible-description: "Applies case conversion to the whole name, including its extension.";
+                                }
+                            }
+                            if root.editor_kind == 5 : Text {
+                                text: "This rule has no settings. It removes leading and trailing spaces and collapses runs of spaces into one.";
+                                wrap: word-wrap;
+                                color: #4a5568;
+                            }
+                            if root.editor_kind == 6 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "New extension"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_extension;
+                                    placeholder-text: "jpg (leave blank to remove the extension)";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "New extension";
+                                    accessible-description: "Replaces the current extension. A leading dot is optional; leaving this blank removes the extension.";
+                                }
+                            }
+                            if root.editor_kind == 7 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Date source"; font-weight: 600; }
+                                ComboBox {
+                                    model: ["Filesystem modified time", "JPEG capture date (Exif)"];
+                                    current-index <=> root.editor_date_source_index;
+                                    selected => { root.editor_changed(); }
+                                    accessible-label: "Date source";
+                                    accessible-description: "Where the date comes from. JPEG capture date needs Exif metadata; files without it are blocked with an explanation.";
+                                }
+                                Text { text: "Date format"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_date_format;
+                                    placeholder-text: "[year]-[month]-[day]";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Date format";
+                                    accessible-description: "A time format description, for example [year]-[month]-[day] or [year][month][day].";
+                                }
+                                Text { text: "Separator after the date"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_date_separator;
+                                    placeholder-text: "_";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Date separator";
+                                    accessible-description: "Text placed between the formatted date and the existing name.";
+                                }
+                            }
+                            if root.editor_kind == 8 : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "Separator before the number"; font-weight: 600; }
+                                LineEdit {
+                                    text <=> root.editor_counter_separator;
+                                    placeholder-text: "_";
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Counter separator";
+                                    accessible-description: "Text placed between the name and the counter.";
+                                }
+                                Text { text: "First number"; font-weight: 600; }
+                                SpinBox {
+                                    value <=> root.editor_counter_start;
+                                    minimum: 1;
+                                    maximum: 999999;
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "First counter number";
+                                    accessible-description: "The number assigned to the first file in the chosen numbering order.";
+                                }
+                                Text { text: "Digits"; font-weight: 600; }
+                                SpinBox {
+                                    value <=> root.editor_counter_width;
+                                    minimum: 1;
+                                    maximum: 9;
+                                    edited => { root.editor_changed(); }
+                                    accessible-label: "Counter digits";
+                                    accessible-description: "How many digits the number is padded to, for example 4 gives 0001.";
+                                }
+                            }
+                            Text {
+                                text: root.editor_hint;
+                                wrap: word-wrap;
+                                color: #4a5568;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -174,7 +512,34 @@ export component MainWindow inherits Window {
                 VerticalLayout {
                     padding: 14px;
                     spacing: 8px;
-                    Text { text: "Preview"; font-size: 18px; font-weight: 700; color: #172033; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Preview"; font-size: 18px; font-weight: 700; color: #172033; horizontal-stretch: 1; }
+                        Text { text: "Show"; color: #334155; vertical-alignment: center; }
+                        ComboBox {
+                            width: 210px;
+                            model: ["Everything", "Will change", "Blocked", "Needs review"];
+                            current-index <=> root.filter_index;
+                            selected => { root.filter_changed(root.filter_index); }
+                            accessible-label: "Preview filter";
+                            accessible-description: "Show every row, only rows that will change, only blocked rows, or only rows with warnings. Filtering never changes the plan or what Apply does.";
+                        }
+                        Text { text: "Sort"; color: #334155; vertical-alignment: center; }
+                        ComboBox {
+                            width: 190px;
+                            model: ["Plan order", "Current A–Z", "Current Z–A", "Proposed A–Z", "Proposed Z–A", "Status"];
+                            current-index <=> root.preview_sort_index;
+                            selected => { root.preview_sort_changed(root.preview_sort_index); }
+                            accessible-label: "Preview sort order";
+                            accessible-description: "Order the preview rows on screen. Sorting never changes plan order, counter numbering, or what Apply does.";
+                        }
+                        Button {
+                            text: "Export list";
+                            enabled: root.rows.length > 0 || root.export_path != "";
+                            clicked => { root.export_rows(); }
+                            accessible-description: "Write the reviewed names to a CSV file for review or record keeping. Names only; no file contents.";
+                        }
+                    }
                     Text {
                         text: root.risk_budget;
                         wrap: word-wrap;
@@ -188,6 +553,7 @@ export component MainWindow inherits Window {
                         accessible-label: "Order summary";
                     }
                     HorizontalLayout {
+                        Text { text: "Include"; width: 62px; font-weight: 700; color: #334155; }
                         Text { text: "Current name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
                         Text { text: "Proposed name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
                         Text { text: "Status"; width: 150px; font-weight: 700; color: #334155; }
@@ -201,6 +567,13 @@ export component MainWindow inherits Window {
                             TouchArea { clicked => { root.select_row(idx); } }
                             HorizontalLayout {
                                 spacing: 8px;
+                                CheckBox {
+                                    width: 62px;
+                                    checked: row.included;
+                                    toggled => { root.toggle_row(idx); }
+                                    accessible-label: "Include this file";
+                                    accessible-description: "Uncheck to leave this file untouched. Apply uses only the included rows, and the risk summary updates immediately.";
+                                }
                                 Text { text: row.old_name; horizontal-stretch: 1; overflow: elide; }
                                 Text { text: row.proposed_name; horizontal-stretch: 1; overflow: elide; color: #0f5132; }
                                 Text { text: row.state; width: 150px; overflow: elide; color: #334155; }
@@ -218,6 +591,93 @@ export component MainWindow inherits Window {
                         wrap: word-wrap;
                         color: #334155;
                         accessible-label: "Status";
+                    }
+                    LineEdit {
+                        text <=> root.export_path;
+                        placeholder-text: "CSV export path — leave blank to write into the app's exports folder";
+                        accessible-label: "CSV export path";
+                        accessible-description: "Where Export list writes the reviewed rows as CSV.";
+                    }
+                    Rectangle { height: 1px; background: #dbe3ee; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text <=> root.mapping_path;
+                            placeholder-text: "Mapping CSV path — current_name,proposed_name rows";
+                            accessible-label: "Mapping CSV path";
+                            accessible-description: "A CSV file of explicit renames. Importing builds a preview from the list instead of the rules; nothing changes until you apply that preview.";
+                        }
+                        Button {
+                            text: "Import mapping";
+                            clicked => { root.import_mapping(); }
+                            accessible-description: "Build a preview from the mapping CSV instead of the rules. Files with no row keep their name and are marked for review.";
+                        }
+                    }
+                    Text {
+                        text: root.mapping_detail;
+                        wrap: word-wrap;
+                        color: #334155;
+                        accessible-label: "Mapping import details";
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-width: 1px;
+            border-radius: 8px;
+            height: 200px;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                Text { text: "Plan handoff"; font-size: 18px; font-weight: 700; color: #172033; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.plan_path;
+                        placeholder-text: "Plan file path — leave blank to save into the app's plans folder";
+                        accessible-label: "Plan file path";
+                        accessible-description: "Where Save plan writes the plan, or which plan file Open plan reviews. A plan file contains paths and rules, never file contents.";
+                    }
+                    Button {
+                        text: "Save plan";
+                        clicked => { root.save_plan(); }
+                        accessible-description: "Write the reviewed plan to a portable file that someone else can revalidate and apply.";
+                    }
+                    Button {
+                        text: "Open plan";
+                        clicked => { root.open_plan(); }
+                        accessible-description: "Open a plan file and re-check every row against the folder as it exists now. Nothing is changed until you apply the safe subset.";
+                    }
+                    Button {
+                        text: "Apply unchanged rows";
+                        enabled: root.can_apply_handoff && !root.applying;
+                        clicked => { root.apply_handoff(); }
+                        accessible-description: "Apply only the rows that still match the plan. Changed, missing, or occupied rows are skipped and left alone.";
+                    }
+                }
+                Text {
+                    text: root.handoff_detail;
+                    wrap: word-wrap;
+                    color: #334155;
+                    accessible-label: "Plan review";
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        for row[idx] in root.handoff_rows : Rectangle {
+                            height: 28px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: row.name; width: 200px; font-weight: 600; overflow: elide; color: #172033; }
+                                Text { text: row.state; width: 150px; overflow: elide; color: #334155; }
+                                Text { text: row.detail; horizontal-stretch: 1; overflow: elide; color: #4a5568; }
+                            }
+                        }
                     }
                 }
             }
@@ -280,15 +740,23 @@ export component MainWindow inherits Window {
             border-color: #cbd5e1;
             border-width: 1px;
             border-radius: 8px;
-            height: 68px;
+            height: 84px;
             HorizontalLayout {
                 padding: 12px;
                 spacing: 12px;
-                Text {
-                    text: "Files are never changed by Scan or Refresh preview. Apply is enabled only when the plan has no blocking errors.";
+                VerticalLayout {
                     horizontal-stretch: 1;
-                    wrap: word-wrap;
-                    color: #334155;
+                    spacing: 6px;
+                    Text {
+                        text: "Files are never changed by Scan or Refresh preview. Apply is enabled only when the plan has no blocking errors.";
+                        wrap: word-wrap;
+                        color: #334155;
+                    }
+                    ProgressIndicator {
+                        progress: root.progress_value;
+                        accessible-label: "Job progress";
+                        accessible-description: "Progress of the current apply job. The status text reports the same progress as numbers for screen readers.";
+                    }
                 }
                 Button {
                     text: "Stop";

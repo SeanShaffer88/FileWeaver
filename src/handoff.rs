@@ -22,14 +22,14 @@ use crate::domain::{
 use crate::planner::{PlanError, plan, subset_plan};
 use crate::rules::RulePipeline;
 
-pub const PLAN_FORMAT: &str = "fileweaver-plan";
+pub const PLAN_FORMAT: &str = "filenameweaver-plan";
 pub const PLAN_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum HandoffError {
-    #[error("this file is not a FileWeaver plan (format tag found: {0:?})")]
+    #[error("this file is not a FilenameWeaver plan (format tag found: {0:?})")]
     WrongFormat(String),
-    #[error("plan format version {0} is not supported by this version of FileWeaver")]
+    #[error("plan format version {0} is not supported by this version of FilenameWeaver")]
     UnsupportedVersion(u32),
     #[error("the plan file could not be parsed: {0}")]
     Json(#[from] serde_json::Error),
@@ -49,7 +49,7 @@ pub struct HandoffAction {
     pub stages: Vec<StageValue>,
 }
 
-/// The portable plan file (`.fileweaver-plan.json`). The envelope fields are
+/// The portable plan file (`.filenameweaver-plan.json`). The envelope fields are
 /// the format commitment; the inner objects reuse the shapes the journal
 /// already serializes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +97,7 @@ impl PlanFile {
     }
 
     /// Parses a plan file, refusing anything that is not a supported
-    /// FileWeaver plan with a specific reason.
+    /// FilenameWeaver plan with a specific reason.
     pub fn from_json(text: &str) -> Result<Self, HandoffError> {
         let file: PlanFile = serde_json::from_str(text)?;
         if file.format != PLAN_FORMAT {

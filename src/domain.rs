@@ -65,7 +65,7 @@ pub enum CollisionPolicy {
 /// in the journal with the job.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortOrder {
-    /// Case-insensitive full path. The original FileWeaver order.
+    /// Case-insensitive full path. The original FilenameWeaver order.
     #[default]
     Path,
     /// Case-insensitive file name; ties fall back to full path.
@@ -161,6 +161,7 @@ pub enum PlanIssueKind {
     MissingDestinationRoot,
     InvalidRule,
     MissingMetadata,
+    MappingProblem,
     NoChange,
     SequenceGap,
 }

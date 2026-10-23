@@ -1,8 +1,8 @@
-# FileWeaver — market research, product direction, and architecture plan
+# FilenameWeaver — market research, product direction, and architecture plan
 
 **Research date:** 2026-10-20 (America/Chicago)  
-**Provisional working name:** FileWeaver  
-**Implementation checkpoint:** The accompanying `0.1.0` source implements the first core slice (planner, validation, staged executor, local ledger, and a limited desktop shell). It does **not** yet implement this entire plan. In particular, current rollback uses a conservative size/modified-time fingerprint rather than stable Windows file identity, and the UI does not yet expose recovery, advanced rules, templates, move/copy, or issue filtering. Two plan details differ in the current code and are worth knowing when reading §4 and §7: the conflict policy **blocks** a job that has any blocking issue rather than skipping individual rows (§4 item 17 describes the intended policy), and the implemented layout is a **single crate** with modules (`src/lib.rs` + `src/*.rs`, see the README's project layout), not the multi-crate workspace sketched in §7. See the README for exact current scope.  
+**Name:** FilenameWeaver (renamed from the earlier working name)  
+**Implementation checkpoint:** The accompanying `0.1.0` source implements the first core slice (planner, validation, staged executor, local ledger, and a limited desktop shell). It does **not** yet implement this entire plan. In particular, current rollback uses a conservative size/modified-time fingerprint rather than stable Windows file identity, the UI now exposes the recovery ledger, the full ordered rule stack, named rule presets, per-row inclusion, preview filters, CSV export of the reviewed list, and the plan handoff (save, revalidate, apply the unchanged subset), but it still does not expose move or copy destinations, sortable columns, mapping import, or a native file picker. Two plan details differ in the current code and are worth knowing when reading §4 and §7: the conflict policy **blocks** a job that has any blocking issue among the included rows; the planner never silently skips a row, although the shell now lets a user exclude a row explicitly (§4 item 17 describes the intended policy), and the implemented layout is a **single crate** with modules (`src/lib.rs` + `src/*.rs`, see the README's project layout), not the multi-crate workspace sketched in §7. See the README for exact current scope.  
 **Evidence standard:** Product facts below come from official product pages, manuals, release notes, or official Microsoft documentation. Feature marketing claims have not been independently benchmarked. “Not verified” means the official sources reviewed did not establish the point—not that the product lacks it.
 
 ## 1. Product definition and working assumptions
@@ -98,7 +98,7 @@ A local-first Windows studio for safely renaming, moving, and copying large grou
 
 ## 4. Feature-by-feature fit assessment
 
-The assessment below evaluates the merged feature inventory for **FileWeaver**, not whether a competitor made a good choice. Complexity assumes a safe Rust implementation with preview and regression tests.
+The assessment below evaluates the merged feature inventory for **FilenameWeaver**, not whether a competitor made a good choice. Complexity assumes a safe Rust implementation with preview and regression tests.
 
 | # | Feature | User problem / beneficiaries | Fit, advantages, drawbacks | Complexity, dependencies, maintenance | Decision |
 |---:|---|---|---|---|---|
@@ -185,7 +185,7 @@ The market review establishes that previews, undo, presets, metadata tokens, and
 |---:|---|---|---|---|---|
 | 1 | **Rename Ledger with divergence-aware recovery** | Each completed job becomes a receipt showing original path, target path, fingerprint check (size + modification time), rule snapshot, and result. “Undo” performs a preflight; if a file has been modified or replaced, it stops that row and offers locate/skip/export guidance. | Existing tools document undo/history, but a durable, per-item recovery workflow that explicitly detects divergence and helps resolve it is a promising distinction. | **Very high value; medium-high feasibility.** Risk: users may expect impossible reversal after external edits; wording must be exact. SQLite schema migrations and file identity edge cases are ongoing work. | Rename 200 files; manually move/edit/delete 12; evaluate whether five archivists understand the recovery report and avoid unsafe choices. |
 | 2 | **Order Observatory** | Before numbering, the app states: “Sorted by Exif capture time ascending; ties by original filename; 18 items have no Exif date.” It lets users inspect ties and preview numbering changes. | Other apps sort and number; exposing the *reasoning*, ambiguities, and fallback sequence as first-class information directly addresses a common hidden failure. | **High value; high feasibility.** Maintenance is limited to sort definitions. Risk: too much detail for casual users; put it in a collapsible “Numbering order” card. | Give photographers files with identical/missing timestamps. Compare accurate results and task confidence against a traditional numbering dialog. |
-| 3 | **Sidecar and sibling relationship groups** | When a user selects `IMG_0123.CR3`, FileWeaver can offer to include known sidecars such as `.xmp`, matching JPEGs, captions, or configured extensions, and previews the group together. | Some media tools organize companion files, but a configurable, visible relationship group for camera/archive workflows is a strong hypothesis. | **High value; medium feasibility.** Risk: false relationships; never auto-include by default and show every group member. Configurable patterns require careful documentation. | Observe photographers using RAW+XMP+JPEG folders; measure mistaken partial renames with and without the suggestion. |
+| 3 | **Sidecar and sibling relationship groups** | When a user selects `IMG_0123.CR3`, FilenameWeaver can offer to include known sidecars such as `.xmp`, matching JPEGs, captions, or configured extensions, and previews the group together. | Some media tools organize companion files, but a configurable, visible relationship group for camera/archive workflows is a strong hypothesis. | **High value; medium feasibility.** Risk: false relationships; never auto-include by default and show every group member. Configurable patterns require careful documentation. | Observe photographers using RAW+XMP+JPEG folders; measure mistaken partial renames with and without the suggestion. |
 | 4 | **Naming Contract** | A saved preset can include human-readable policies and executable checks: required date format, maximum name length, forbidden punctuation, sequence uniqueness, and sample input→expected output tests. Users see a green “contract satisfied” preview. | Competitors have validation and presets, but combining policy documentation, expected examples, and preflight checks supports institutional archives and repeatable handoffs. | **High professional value; medium feasibility.** Risk: it can feel like programming; offer plain templates first. JSON schema versioning is manageable. | Partner with an archive team; encode one real collection specification and see whether staff can audit a new import without a naming expert. |
 | 5 | **Risk Budget summary** | Preview begins with a textual safety summary: “1,248 ready; 3 skipped conflicts; 6 missing metadata; 41 cross-volume copies; no overwrites.” Each total links to filtered rows. | Previews are ubiquitous; converting problems into a categorized, action-oriented decision summary could reduce overlooked warnings. | **High value; high feasibility.** Risk: color-only design; must include icons/text/counts and accessible live updates. | A/B task test: ask novices whether applying is safe and why; require them to locate all blocking issues. |
 | 6 | **Rule-stage provenance** | Select a row and see each intermediate name: original → cleaned → date inserted → numbered → destination path. Professionals can toggle individual rules for a subset without losing the whole job. | Ordered stacks exist; per-row intermediate provenance makes complex pipelines explainable and debuggable. | **High value; medium feasibility.** Rule engine should preserve stage outputs; memory must be bounded/virtualized for huge batches. | Ask experienced users to diagnose three incorrect outcomes. Measure time-to-fix vs. final-output-only preview. |
@@ -196,7 +196,7 @@ Build **Rename Ledger**, **Order Observatory**, **Risk Budget**, and **Rule-stag
 
 ## 7. Architecture & UX plan (before implementation)
 
-> **Status note (0.1.0):** this section is the pre-implementation plan and is written in the present tense, but the shipped shell is much smaller: a paste-a-path field, three rules (prefix, literal replace, counter), Scan / Refresh / Apply, and a status line. There is no drag-and-drop, no template picker, no per-row exclusion, no progress/stop UI, no report, and no undo surface yet, and the palette is a fixed light theme. Where this section and the README disagree, the README describes the shipped build. Toolchain and build instructions live in the README.
+> **Status note (0.1.0):** this section is the pre-implementation plan and is written in the present tense, but the shipped shell is smaller: a pasted folder path with optional subfolders, an ordered rule stack (prefix, suffix, literal replace, regex, case, whitespace, extension, date, counter), named presets, per-row inclusion, preview state filters, a risk budget, rule-stage provenance, CSV export of the reviewed list, plan handoff (save, revalidate, apply the unchanged rows), and a recovery ledger with confirmed rollback. Still absent: drag-and-drop intake, a native file picker, sortable columns, thumbnails, a progress bar, mapping import, a full job report, folder mutation, move/copy destinations in the UI, and theme support. Where this section and the README disagree, the README describes the shipped build.
 
 ### UI framework choice
 
@@ -211,10 +211,10 @@ Framework evidence: [Slint desktop/native styles](https://slint.dev/desktop), [S
 
 ### Application structure
 
-> **Implementation note (0.1.0):** the sketch below is the planned multi-crate layout. The shipped code is a single crate — `fileweaver_core` in `src/lib.rs` with modules per concern, plus the Slint shell in `src/main.rs` / `ui/main.slint` — and there are no `resources/templates/` or `docs/decisions/` directories yet. Treat the paths below as direction, not as a map of the current tree.
+> **Implementation note (0.1.0):** the sketch below is the planned multi-crate layout. The shipped code is a single crate — `filenameweaver_core` in `src/lib.rs` with modules per concern, plus the Slint shell in `src/main.rs` / `ui/main.slint` — and there are no `resources/templates/` or `docs/decisions/` directories yet. Treat the paths below as direction, not as a map of the current tree.
 
 ```text
-fileweaver/
+filenameweaver/
   crates/
     core/          # Pure rule model, planning, validation, collision graph, unit tests
     metadata/      # Filesystem/JPEG-Exif reading behind typed capabilities
@@ -228,7 +228,7 @@ fileweaver/
 ```
 
 - **Pure planning path:** input snapshots + rules → immutable proposed actions + warnings/errors. It performs no writes and is unit-testable.
-- **Execution path:** only validated, selected actions go to a bounded worker. It reports structured events to the UI and commits journal status after meaningful transitions. *(0.1.0: no per-row selection exists — all non-blocked, changing actions run, on one background thread per apply.)*
+- **Execution path:** only validated, selected actions go to a bounded worker. It reports structured events to the UI and commits journal status after meaningful transitions. *(0.1.0: the shell can exclude rows, but there is no partial selection of rules, and the included actions run on one background thread per apply.)*
 - **Journal/recovery path:** rollback records its outcome on the original job's item rows; it never “pretends” that a divergent file was restored.
 - **UI path:** keeps file I/O, Exif parsing, and traversal off the UI event loop. Virtualized rows and a bounded thumbnail cache are design targets; 0.1.0 renders all preview rows directly, and has no thumbnails or hashing.
 
@@ -273,9 +273,9 @@ fileweaver/
 
 ### Local data, portability, and privacy
 
-- Store user state under `%LOCALAPPDATA%\FileWeaver\`:
-  - `operations.sqlite` — completed/in-progress job metadata and rollback records *(the only file 0.1.0 creates)*;
-  - `presets/*.json` — user templates, with a documented schema version *(planned, not yet created)*;
+- Store user state under `%LOCALAPPDATA%\FilenameWeaver\`:
+  - `operations.sqlite` — completed/in-progress job metadata and rollback records;
+  - `presets/*.json` — saved rule stacks. Each file carries a format tag and version that are refused when unknown, is written through a temporary file plus a rename, and contains rules only (no file paths);
   - `settings.json` — non-sensitive UI preferences *(planned, not yet created)*.
 - *(Planned)* Exports are opt-in CSV and JSON; they contain paths, so the export dialog will warn before sharing. No export exists in 0.1.0.
 - A later portable mode will place the same data beside the executable only after removable-drive recovery behavior is tested.
@@ -291,7 +291,7 @@ fileweaver/
 
 ### Verification plan before any “complete” claim
 
-The lists below are the *planned* coverage, not the current suite: 0.1.0 has 7 tests (see the README's Build and verify section).
+The lists below are the *planned* coverage, not the current suite: 0.1.0 has 51 unit tests (see the README's Build and verify section).
 
 - Core unit tests: name parsing, sort determinism, rule composition, invalid names, collisions, counters, CSV import, Exif absence/corruption, and journal transitions.
 - Integration tests in disposable directories: cycles, case-only changes, duplicate targets, cancellations, permissions, interrupted jobs, cross-volume simulations where feasible, and divergent rollback.
