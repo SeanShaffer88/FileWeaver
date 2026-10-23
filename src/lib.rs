@@ -7,6 +7,7 @@
 
 pub mod domain;
 pub mod executor;
+pub mod handoff;
 pub mod journal;
 pub mod metadata;
 pub mod planner;
@@ -19,6 +20,7 @@ pub use domain::{
 pub use executor::{
     CancellationToken, Divergence, ExecuteError, ExecuteProgress, Executor, ItemReview, JobReview,
 };
+pub use handoff::{DriftReport, DriftState, HandoffAction, HandoffError, PlanFile, RowDrift};
 pub use journal::{JobSummary, Journal, JournalError, RollbackReport};
-pub use planner::{PlanError, plan};
+pub use planner::{PlanError, plan, subset_plan};
 pub use rules::{Rule, RulePipeline, RuleProblem};
