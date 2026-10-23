@@ -65,6 +65,26 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    ui.on_select_row({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            let text = state.plan.lock().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|plan| plan.actions.get(index))
+                    .map(provenance_text)
+            });
+            if let (Some(ui), Some(text)) = (weak.upgrade(), text) {
+                ui.set_selected_row_index(index as i32);
+                ui.set_provenance(text.into());
+            }
+        }
+    });
+
     ui.on_refresh_ledger({
         let state = Arc::clone(&state);
         let weak = ui.as_weak();
@@ -117,6 +137,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_can_apply(false);
                 ui.set_risk_budget("".into());
                 ui.set_order_summary("".into());
+                ui.set_selected_row_index(-1);
+                ui.set_provenance("".into());
                 ui.set_status(
                     "Settings changed since the preview. Select Refresh preview to review the updated plan before applying."
                         .into(),
@@ -187,6 +209,8 @@ fn schedule_preview(
     ui.set_can_apply(false);
     ui.set_risk_budget("".into());
     ui.set_order_summary("".into());
+    ui.set_selected_row_index(-1);
+    ui.set_provenance("".into());
     ui.set_status(
         if use_current_rules {
             "Refreshing the non-destructive preview…"
@@ -217,6 +241,11 @@ fn schedule_preview(
                     ui.set_status(summary.into());
                     ui.set_risk_budget(risk_budget.into());
                     ui.set_order_summary(order_summary.into());
+                    ui.set_selected_row_index(-1);
+                    ui.set_provenance(
+                        "Select a file row to see how its proposed name was built, rule by rule."
+                            .into(),
+                    );
                     ui.set_can_apply(executable);
                 } else {
                     ui.set_status(
@@ -225,6 +254,8 @@ fn schedule_preview(
                     );
                     ui.set_risk_budget("".into());
                     ui.set_order_summary("".into());
+                    ui.set_selected_row_index(-1);
+                    ui.set_provenance("".into());
                     ui.set_can_apply(false);
                 }
             });
@@ -308,6 +339,8 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
             ui.set_can_apply(false);
             ui.set_risk_budget("".into());
             ui.set_order_summary("".into());
+            ui.set_selected_row_index(-1);
+            ui.set_provenance("".into());
             match result {
             Ok(outcome) if outcome.cancelled => ui.set_status(
                 format!(
@@ -458,6 +491,23 @@ fn risk_budget_text(plan: &PlannedJob) -> String {
             " {} cross-volume move(s) would be copy-then-remove and not atomic.",
             plan.summary.cross_volume_candidates
         ));
+    }
+    text
+}
+
+/// Rule-stage provenance for one preview row: the original name followed by
+/// the result of each rule stage, in pipeline order. The stages were recorded
+/// by the rule engine when the plan was built — this only formats them.
+fn provenance_text(action: &fileweaver_core::PlannedAction) -> String {
+    if action.stages.is_empty() {
+        return format!(
+            "{} — no rules in the pipeline, so the name is unchanged.",
+            action.snapshot.original_name
+        );
+    }
+    let mut text = action.snapshot.original_name.clone();
+    for stage in &action.stages {
+        text.push_str(&format!(" → {}: {}", stage.rule_label, stage.value));
     }
     text
 }
@@ -818,5 +868,57 @@ mod tests {
         let (mut request, pipeline, planned) = sample_plan(dir.path());
         request.recursive = true;
         assert!(!inputs_match(&planned, &request, &pipeline));
+    }
+    #[test]
+    fn provenance_shows_each_rule_stage_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("photo.txt"), b"x").unwrap();
+        let request = PlanRequest {
+            inputs: vec![dir.path().to_path_buf()],
+            operation: OperationKind::Rename,
+            destination_root: None,
+            recursive: false,
+            include_directories: false,
+            collision_policy: CollisionPolicy::Block,
+            allow_legacy_long_paths: false,
+            sort: SortOrder::Path,
+        };
+        let pipeline = RulePipeline {
+            rules: vec![
+                Rule::AddPrefix {
+                    text: "2026-".into(),
+                },
+                Rule::ReplaceText {
+                    find: "photo".into(),
+                    replacement: "image".into(),
+                    replace_all: true,
+                },
+                Rule::AppendCounter {
+                    separator: "_".into(),
+                    start_at: 1,
+                    width: 4,
+                },
+            ],
+        };
+        let planned = plan(request, &pipeline).unwrap();
+        assert_eq!(
+            provenance_text(&planned.actions[0]),
+            "photo.txt → Add prefix: 2026-photo.txt → Replace text: 2026-image.txt → Append counter: 2026-image_0001.txt"
+        );
+    }
+
+    #[test]
+    fn provenance_without_rules_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("photo.txt"), b"x").unwrap();
+        let request = PlanRequest {
+            inputs: vec![dir.path().to_path_buf()],
+            ..PlanRequest::rename(vec![])
+        };
+        let planned = plan(request, &RulePipeline::default()).unwrap();
+        assert_eq!(
+            provenance_text(&planned.actions[0]),
+            "photo.txt — no rules in the pipeline, so the name is unchanged."
+        );
     }
 }
