@@ -466,6 +466,7 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             let target = handoff_path_for(ui.get_plan_path().trim(), &plan);
             let pipeline = current_pipeline(&state);
+            let weak_for_thread = weak.clone();
             ui.set_status("Saving the reviewed plan file…".into());
             thread::spawn(move || {
                 let file = PlanFile::from_plan(&plan, &pipeline, now_unix_ms());
@@ -473,7 +474,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .to_json()
                     .map_err(|error| error.to_string())
                     .and_then(|text| write_atomically(&target, &text));
-                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
                     Ok(()) => {
                         ui.set_plan_path(target.to_string_lossy().to_string().into());
                         ui.set_can_apply_handoff(false);
@@ -522,6 +523,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 "Revalidating the plan against the folder as it exists now…".into(),
             );
             let state_for_thread = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
             let path_for_thread = path.clone();
             thread::spawn(move || {
                 let result: Result<(PlanFile, DriftReport), String> = (|| {
@@ -531,7 +533,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     let report = file.evaluate().map_err(|error| error.to_string())?;
                     Ok((file, report))
                 })();
-                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
                     Ok((file, report)) => {
                         let rows = handoff_rows(&report);
                         let detail = handoff_detail_text(&file, &report);
@@ -621,11 +623,14 @@ fn main() -> Result<(), slint::PlatformError> {
                 *current = Some(cancellation.clone());
             }
             let state_for_finish = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
             thread::spawn(move || {
                 let result = (|| {
                     let journal = Journal::open(operation_ledger_path())?;
                     let mut executor = Executor::new(journal);
-                    executor.execute(&applicable, &cancellation, |event| update_progress(&weak, event))
+                    executor.execute(&applicable, &cancellation, |event| {
+                        update_progress(&weak_for_thread, event)
+                    })
                 })();
                 if let Ok(mut handoff) = state_for_finish.handoff.lock() {
                     *handoff = None;
@@ -639,8 +644,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 if let Ok(mut guard) = state_for_finish.cancellation.lock() {
                     *guard = None;
                 }
-                refresh_ledger(weak.clone(), Arc::clone(&state_for_finish));
-                let _ = weak.upgrade_in_event_loop(move |ui| {
+                refresh_ledger(weak_for_thread.clone(), Arc::clone(&state_for_finish));
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| {
                     ui.set_applying(false);
                     ui.set_can_apply(false);
                     ui.set_can_apply_handoff(false);
