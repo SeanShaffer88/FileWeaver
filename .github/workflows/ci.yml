@@ -42,8 +42,30 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Diagnostics are echoed as workflow annotations so a failing run explains
+      # itself in the pull request's Checks tab without downloading logs.
       - name: Clippy (warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          set +e
+          cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^(error|warning)" clippy.txt | head -40 | while IFS= read -r line; do
+              echo "::error title=clippy::$line"
+            done
+            grep -E "^\./|^src/" clippy.txt | head -40 | while IFS= read -r line; do
+              echo "::error title=clippy detail::$line"
+            done
+            exit "$status"
+          fi
 
       - name: Tests
-        run: cargo test
+        run: |
+          set +e
+          cargo test 2>&1 | tee tests.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^(error|test .* FAILED|failures:|---- )|panicked at" tests.txt | head -40 \
+              | while IFS= read -r line; do echo "::error title=test::$line"; done
+            exit "$status"
+          fi
