@@ -2415,7 +2415,9 @@ mod tests {
     #[test]
     fn filters_select_rows_without_reordering_them() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["a.txt", "b.txt", "CON.txt"] {
+        // The prefix rule collides with an existing file for `a.txt`, which is
+        // a realistic blocking error; the other two rows are ready to apply.
+        for name in ["a.txt", "b.txt", "x-a.txt"] {
             fs::write(dir.path().join(name), "x").unwrap();
         }
         let pipeline = RulePipeline {
@@ -2435,10 +2437,10 @@ mod tests {
         // the wrong file after filtering.
         assert_eq!(rows[1].plan_index, 1);
 
-        let (rows, visible) = render_rows(&planned, &excluded, PreviewFilter::Blocked);
-        assert_eq!(rows.len(), 1, "only the reserved-name target is blocked");
-        assert_eq!(visible, vec![rows[0].plan_index as usize]);
-        assert_eq!(rows[0].old_name, "CON.txt");
+        let (blocked, visible) = render_rows(&planned, &excluded, PreviewFilter::Blocked);
+        assert_eq!(blocked.len(), 1, "only the existing-target row is blocked");
+        assert_eq!(blocked[0].old_name, "a.txt");
+        assert_eq!(visible, vec![blocked[0].plan_index as usize]);
 
         let (changes, _) = render_rows(&planned, &excluded, PreviewFilter::Changes);
         assert_eq!(changes.len(), 2);
