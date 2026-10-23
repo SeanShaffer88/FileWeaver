@@ -29,6 +29,8 @@ export component MainWindow inherits Window {
     in-out property <string> order_summary: "";
     in-out property <string> status: "Choose a folder or paste its path, then select Scan to create a safe preview.";
     in-out property <[PreviewRow]> rows: [];
+    in-out property <int> selected_row_index: -1;
+    in-out property <string> provenance: "";
     in-out property <[LedgerRow]> ledger_rows: [];
     in-out property <int> selected_job_index: -1;
     in-out property <string> ledger_detail: "Select Refresh history to load recorded jobs.";
@@ -43,6 +45,7 @@ export component MainWindow inherits Window {
     callback refresh_ledger();
     callback select_job(int);
     callback rollback_selected();
+    callback select_row(int);
 
     background: #f7f8fa;
 
@@ -192,8 +195,10 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #dbe3ee; }
                     ScrollView {
                         vertical-stretch: 1;
-                        for row in root.rows : Rectangle {
+                        for row[idx] in root.rows : Rectangle {
                             height: 30px;
+                            background: idx == root.selected_row_index ? #e2e8f0 : transparent;
+                            TouchArea { clicked => { root.select_row(idx); } }
                             HorizontalLayout {
                                 spacing: 8px;
                                 Text { text: row.old_name; horizontal-stretch: 1; overflow: elide; }
@@ -201,6 +206,12 @@ export component MainWindow inherits Window {
                                 Text { text: row.state; width: 150px; overflow: elide; color: #334155; }
                             }
                         }
+                    }
+                    Text {
+                        text: root.provenance;
+                        wrap: word-wrap;
+                        color: #334155;
+                        accessible-label: "How the selected name was built";
                     }
                     Text {
                         text: root.status;

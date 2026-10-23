@@ -16,13 +16,14 @@
 - Records applied items in a local SQLite operation ledger and supplies conservative rollback in the core API. Rollback rejects files whose recorded post-operation fingerprint has changed.
 - Shows a **Risk Budget** line with every preview: how many files will change, are blocked, need review, or stay unchanged — and that the plan overwrites nothing.
 - Provides a **Recovery ledger** panel in the shell: recent jobs can be selected to review how their files look now (unchanged, changed, or missing, using the same fingerprint check rollback performs), then rolled back behind a two-step confirmation. Rollback restores only unchanged files whose original location is still free; changed or missing files are never overwritten.
+- Explains every proposed name: selecting a preview row shows its **rule-stage provenance** — the original name followed by the result of each rule in order (for example `photo.txt → Add prefix: 2026-photo.txt → Append counter: 2026-photo_0001.txt`) — using the stage results the rule engine records when the plan is built.
 - Reads JPEG Exif capture timestamps (`.jpg`/`.jpeg`, `DateTimeOriginal` then `DateTimeDigitized`) while planning. The core date rule can use them; the first UI slice does not expose that rule yet.
 - Exposes Slint accessibility metadata for the implemented controls, keyboard-focusable standard controls, and status text.
 
 ## Intentionally not yet exposed or complete
 
 - Native file/folder picker and drag-and-drop intake (paste a path in the current shell).
-- Per-row inclusion/exclusion, issue filters, sortable columns, thumbnails, risk-dashboard links, and rule-stage inspector UI.
+- Per-row inclusion/exclusion, issue filters, sortable columns, and thumbnails.
 - UI controls for the regex, case, and date/Exif rules and for copy/move destination templates. Those exist in the core API, but none should be represented as complete UI features.
 - CSV/JSON mapping, saved presets, and report export. These have **no implementation yet**, in the core or the UI.
 - Folder mutation, watched folders, Explorer context menu, portable-data mode, CLI automation, hash/duplicate analysis, metadata writing, document-content classification, integrations, and networking.
