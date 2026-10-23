@@ -100,20 +100,7 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
 
     let sequence_gaps = detect_sequence_gaps(&actions);
     for gap in &sequence_gaps {
-        global_issues.push(PlanIssue::warning(
-            PlanIssueKind::SequenceGap,
-            format!(
-                "Possible sequence gap in {}: {} file(s) match {}, but {} number(s) in the range are missing (first missing: {}). A gap can be legitimate — for example a deleted photo — so nothing is blocked.",
-                gap.folder.display(),
-                gap.present,
-                gap.pattern,
-                gap.missing_count,
-                gap.missing
-                    .first()
-                    .map(|value| format!("{value:0width$}", width = gap.width))
-                    .unwrap_or_default(),
-            ),
-        ));
+        global_issues.push(sequence_gap_issue(gap));
     }
 
     let summary = summarize(&actions, &global_issues);
@@ -125,6 +112,59 @@ pub fn plan(request: PlanRequest, pipeline: &RulePipeline) -> Result<PlannedJob,
         summary,
         sequence_gaps,
     })
+}
+
+fn sequence_gap_issue(gap: &SequenceGap) -> PlanIssue {
+    PlanIssue::warning(
+        PlanIssueKind::SequenceGap,
+        format!(
+            "Possible sequence gap in {}: {} file(s) match {}, but {} number(s) in the range are missing (first missing: {}). A gap can be legitimate — for example a deleted photo — so nothing is blocked.",
+            gap.folder.display(),
+            gap.present,
+            gap.pattern,
+            gap.missing_count,
+            gap.missing
+                .first()
+                .map(|value| format!("{value:0width$}", width = gap.width))
+                .unwrap_or_default(),
+        ),
+    )
+}
+
+/// Returns a copy of `plan` containing only the actions `keep` selects,
+/// re-indexed in their original order. Collision validation, sequence-gap
+/// analysis, and the summary are all recomputed for the subset, so a subset
+/// can never smuggle in a collision or a stale count that the full plan's
+/// validation would have caught. Used to build the applicable subset of a
+/// reviewed plan handoff.
+pub fn subset_plan(plan: &PlannedJob, keep: impl Fn(&PlannedAction) -> bool) -> PlannedJob {
+    let mut actions: Vec<PlannedAction> = plan
+        .actions
+        .iter()
+        .filter(|action| keep(action))
+        .cloned()
+        .collect();
+    for (index, action) in actions.iter_mut().enumerate() {
+        action.index = index;
+    }
+    apply_collision_validation(&mut actions, plan.request.collision_policy);
+    let sequence_gaps = detect_sequence_gaps(&actions);
+    let mut global_issues: Vec<PlanIssue> = plan
+        .global_issues
+        .iter()
+        .filter(|issue| issue.kind != PlanIssueKind::SequenceGap)
+        .cloned()
+        .collect();
+    global_issues.extend(sequence_gaps.iter().map(sequence_gap_issue));
+    let summary = summarize(&actions, &global_issues);
+    PlannedJob {
+        request: plan.request.clone(),
+        pipeline_json: plan.pipeline_json.clone(),
+        global_issues,
+        actions,
+        summary,
+        sequence_gaps,
+    }
 }
 
 fn collect_snapshots(request: &PlanRequest) -> (Vec<FileSnapshot>, Vec<PlanIssue>) {
