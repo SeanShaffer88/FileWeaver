@@ -4,6 +4,7 @@ export struct PreviewRow {
     old_name: string,
     proposed_name: string,
     state: string,
+    included: bool,
 }
 
 export struct RuleRow {
@@ -86,6 +87,7 @@ component MainWindow inherits Window {
     callback select_job(int);
     callback rollback_selected();
     callback select_row(int);
+    callback toggle_row(int);
 
     background: #f7f8fa;
 
@@ -491,6 +493,7 @@ component MainWindow inherits Window {
                         accessible-label: "Order summary";
                     }
                     HorizontalLayout {
+                        Text { text: "Include"; width: 62px; font-weight: 700; color: #334155; }
                         Text { text: "Current name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
                         Text { text: "Proposed name"; font-weight: 700; horizontal-stretch: 1; color: #334155; }
                         Text { text: "Status"; width: 150px; font-weight: 700; color: #334155; }
@@ -504,6 +507,13 @@ component MainWindow inherits Window {
                             TouchArea { clicked => { root.select_row(idx); } }
                             HorizontalLayout {
                                 spacing: 8px;
+                                CheckBox {
+                                    width: 62px;
+                                    checked: row.included;
+                                    toggled => { root.toggle_row(idx); }
+                                    accessible-label: "Include this file";
+                                    accessible-description: "Uncheck to leave this file untouched. Apply uses only the included rows, and the risk summary updates immediately.";
+                                }
                                 Text { text: row.old_name; horizontal-stretch: 1; overflow: elide; }
                                 Text { text: row.proposed_name; horizontal-stretch: 1; overflow: elide; color: #0f5132; }
                                 Text { text: row.state; width: 150px; overflow: elide; color: #334155; }

@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,7 +11,7 @@ use fileweaver_core::{
     CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, ExecuteError,
     ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError, OperationKind,
     PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary, RollbackReport, Rule,
-    RulePipeline, SortOrder, plan,
+    RulePipeline, SortOrder, plan, subset_plan,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
@@ -19,6 +20,10 @@ slint::include_modules!();
 #[derive(Default)]
 struct AppState {
     plan: Mutex<Option<PlannedJob>>,
+    /// Source paths the user unchecked in the preview. Keyed the same way the
+    /// planner keys collisions, so the choice survives a re-render and is
+    /// applied through `subset_plan` rather than by editing the plan.
+    excluded: Mutex<BTreeSet<String>>,
     /// The ordered rule stack shown in the shell. This is the single source of
     /// truth for the next preview; the UI only edits it.
     rules: Mutex<Vec<Rule>>,
@@ -230,6 +235,34 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(ui) = weak.upgrade() {
                 refresh_rule_ui(&ui, &state);
             }
+        }
+    });
+
+    ui.on_toggle_row({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let key = state.plan.lock().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|plan| plan.actions.get(index))
+                    .map(|action| plan_key(&action.snapshot.source))
+            });
+            let Some(key) = key else {
+                return;
+            };
+            if let Ok(mut excluded) = state.excluded.lock()
+                && !excluded.remove(&key)
+            {
+                excluded.insert(key);
+            }
+            refresh_preview_view(&ui, &state);
         }
     });
 
@@ -524,6 +557,11 @@ fn schedule_preview(
 
     let pipeline = current_pipeline(&state);
     let request = request_from_ui(&ui);
+    // A fresh scan starts from every file included; the previous exclusion
+    // choices belong to a plan that is being replaced.
+    if let Ok(mut excluded) = state.excluded.lock() {
+        excluded.clear();
+    }
     ui.set_can_apply(false);
     ui.set_risk_budget("".into());
     ui.set_order_summary("".into());
@@ -543,9 +581,9 @@ fn schedule_preview(
     let summary_pipeline = pipeline.clone();
     thread::spawn(move || match plan(request, &pipeline) {
         Ok(new_plan) => {
-            let rows = rows_for_plan(&new_plan);
+            let rows = rows_for_plan(&new_plan, &BTreeSet::new());
             let summary = summary_text(&new_plan);
-            let risk_budget = risk_budget_text(&new_plan);
+            let risk_budget = risk_budget_text(&new_plan, 0);
             let order_summary = order_summary_text(&new_plan, &summary_pipeline);
             let executable = new_plan.is_executable();
             let plan_for_check = new_plan.clone();
@@ -574,6 +612,9 @@ fn schedule_preview(
                     // must not remain available to Apply either.
                     if let Ok(mut stored) = state_for_check.plan.lock() {
                         *stored = None;
+                    }
+                    if let Ok(mut excluded) = state_for_check.excluded.lock() {
+                        excluded.clear();
                     }
                     ui.set_status(
                         "Settings changed while the preview was building. Select Refresh preview to review the updated plan before applying."
@@ -607,12 +648,6 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         }
         return;
     };
-    if !plan.is_executable() {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_status("Resolve blocking preview errors before applying changes.".into());
-        }
-        return;
-    }
     // Final guard: never execute a plan whose folder or rules no longer match
     // what the user sees, even if an input change somehow reached Apply
     // without invalidating the preview first.
@@ -632,6 +667,24 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         return;
     }
 
+    // Only the rows the user still has included are applied. `subset_plan`
+    // re-runs collision and filename validation for the subset, so an
+    // exclusion can never bypass a blocking error.
+    let excluded_count = state.excluded.lock().map(|set| set.len()).unwrap_or(0);
+    let applicable = applicable_plan_of(&plan, &excluded_set(&state));
+    if !applicable.is_executable() {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_status(
+                if applicable.summary.ready == 0 {
+                    "No files are included for apply. Include at least one row, or refresh the preview."
+                } else {
+                    "Resolve blocking preview errors before applying changes."
+                }
+                .into(),
+            );
+        }
+        return;
+    }
     let cancellation = CancellationToken::default();
     if let Ok(mut current) = state.cancellation.lock() {
         *current = Some(cancellation.clone());
@@ -650,12 +703,17 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         let result = (|| {
             let journal = Journal::open(operation_ledger_path())?;
             let mut executor = Executor::new(journal);
-            executor.execute(&plan, &cancellation, |event| update_progress(&weak, event))
+            executor.execute(&applicable, &cancellation, |event| {
+                update_progress(&weak, event)
+            })
         })();
         // The job has changed the folder, so the preview is consumed: a fresh
         // scan is required before anything else can be applied.
         if let Ok(mut guard) = state_for_finish.plan.lock() {
             *guard = None;
+        }
+        if let Ok(mut guard) = state_for_finish.excluded.lock() {
+            guard.clear();
         }
         if let Ok(mut guard) = state_for_finish.cancellation.lock() {
             *guard = None;
@@ -685,8 +743,14 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
             ),
             Ok(outcome) => ui.set_status(
                 format!(
-                    "Completed {} changes. Job {} is stored locally for a future recovery review.",
-                    outcome.applied, outcome.job_id
+                    "Completed {} changes{}. Job {} is stored locally for a future recovery review.",
+                    outcome.applied,
+                    if excluded_count > 0 {
+                        format!("; {excluded_count} excluded row(s) were left untouched")
+                    } else {
+                        String::new()
+                    },
+                    outcome.job_id
                 )
                 .into(),
             ),
@@ -1041,18 +1105,25 @@ fn apply_editor_to_rule(ui: &MainWindow, rule: &mut Rule) {
     }
 }
 
-fn rows_for_plan(plan: &PlannedJob) -> Vec<PreviewRow> {
+fn rows_for_plan(plan: &PlannedJob, excluded: &BTreeSet<String>) -> Vec<PreviewRow> {
     plan.actions
         .iter()
-        .map(|action| PreviewRow {
-            old_name: action.snapshot.original_name.clone().into(),
-            proposed_name: action.proposed_name.clone().into(),
-            state: row_state(action).into(),
+        .map(|action| {
+            let included = !excluded.contains(&plan_key(&action.snapshot.source));
+            PreviewRow {
+                old_name: action.snapshot.original_name.clone().into(),
+                proposed_name: action.proposed_name.clone().into(),
+                state: row_state(action, included).into(),
+                included,
+            }
         })
         .collect()
 }
 
-fn row_state(action: &fileweaver_core::PlannedAction) -> String {
+fn row_state(action: &fileweaver_core::PlannedAction, included: bool) -> String {
+    if !included {
+        return "Excluded — will not change".into();
+    }
     if let Some(issue) = action
         .issues
         .iter()
@@ -1095,7 +1166,7 @@ fn summary_text(plan: &PlannedJob) -> String {
     }
 }
 
-fn risk_budget_text(plan: &PlannedJob) -> String {
+fn risk_budget_text(plan: &PlannedJob, excluded: usize) -> String {
     let has_error = |action: &fileweaver_core::PlannedAction| {
         action
             .issues
@@ -1124,7 +1195,68 @@ fn risk_budget_text(plan: &PlannedJob) -> String {
             plan.summary.cross_volume_candidates
         ));
     }
+    if excluded > 0 {
+        text.push_str(&format!(
+            " {excluded} row(s) excluded by you and will not change."
+        ));
+    }
     text
+}
+
+/// Case-insensitive path key, matching the planner's collision key, so an
+/// exclusion follows the file even if the proposal is recomputed.
+fn plan_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+fn excluded_set(state: &AppState) -> BTreeSet<String> {
+    state
+        .excluded
+        .lock()
+        .map(|set| set.clone())
+        .unwrap_or_default()
+}
+
+/// The plan Apply would execute: the full plan with the user's exclusions
+/// removed, revalidated as a subset by the planner.
+fn applicable_plan_of(plan: &PlannedJob, excluded: &BTreeSet<String>) -> PlannedJob {
+    if excluded.is_empty() {
+        return plan.clone();
+    }
+    subset_plan(plan, |action| {
+        !excluded.contains(&plan_key(&action.snapshot.source))
+    })
+}
+
+fn preview_status_text(full: &PlannedJob, applicable: &PlannedJob, excluded: usize) -> String {
+    if excluded == 0 {
+        return summary_text(full);
+    }
+    format!(
+        "{} {excluded} row(s) excluded — Apply will change {} of {} discovered file(s).",
+        summary_text(full),
+        applicable.summary.ready,
+        full.summary.discovered
+    )
+}
+
+/// Re-renders the preview from the stored plan after an inclusion change and
+/// recomputes every consequence: the rows, the risk budget, the order summary,
+/// and whether Apply is available.
+fn refresh_preview_view(ui: &MainWindow, state: &AppState) {
+    let Some(plan) = state.plan.lock().ok().and_then(|guard| guard.clone()) else {
+        return;
+    };
+    let excluded = excluded_set(state);
+    let applicable = applicable_plan_of(&plan, &excluded);
+    let rows = rows_for_plan(&plan, &excluded);
+    ui.set_rows(ModelRc::new(Rc::new(VecModel::from(rows))));
+    ui.set_selected_row_index(-1);
+    ui.set_provenance("".into());
+    ui.set_risk_budget(risk_budget_text(&applicable, excluded.len()).into());
+    ui.set_order_summary(order_summary_text(&applicable, &current_pipeline(state)).into());
+    ui.set_can_apply(applicable.is_executable());
+    ui.set_status(preview_status_text(&plan, &applicable, excluded.len()).into());
 }
 
 /// Rule-stage provenance for one preview row: the original name followed by
@@ -1667,6 +1799,44 @@ mod tests {
         assert_eq!(counter_value("photo_0007.jpg", 4), Some(7));
         assert_eq!(counter_value("photo_07.jpg", 4), None);
         assert_eq!(counter_value("photo_07.jpg", 2), Some(7));
+    }
+
+    #[test]
+    fn excluded_rows_leave_the_applicable_plan_and_are_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x-".into() }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        assert_eq!(planned.actions.len(), 2);
+
+        let mut excluded = BTreeSet::new();
+        excluded.insert(plan_key(&planned.actions[0].snapshot.source));
+
+        let applicable = applicable_plan_of(&planned, &excluded);
+        assert_eq!(applicable.actions.len(), 1);
+        assert_eq!(applicable.actions[0].snapshot.original_name, "b.txt");
+        assert!(applicable.is_executable());
+
+        let rows = rows_for_plan(&planned, &excluded);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].included);
+        assert!(rows[0].state.contains("Excluded"));
+        assert!(rows[1].included);
+        assert!(preview_status_text(&planned, &applicable, 1).contains("1 row(s) excluded"));
+        assert!(risk_budget_text(&applicable, 1).contains("excluded by you"));
+
+        // Excluding everything leaves nothing to apply.
+        excluded.insert(plan_key(&planned.actions[1].snapshot.source));
+        let nothing = applicable_plan_of(&planned, &excluded);
+        assert_eq!(nothing.summary.ready, 0);
+        assert!(!nothing.is_executable());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 - Scans a folder without changing anything. By default only files directly in the selected folder are included; with **Include subfolders** enabled, the scan covers the entire folder tree at any depth.
 - Builds a preview from a **user-ordered rule stack**. The shell can add, select, reorder, edit, and remove these rules: add prefix, add suffix before the extension, literal replace (first or every match), regular-expression replace, change case, trim/collapse whitespace, change extension, date prefix (filesystem modified time or JPEG Exif capture date, with a configurable `time` format and separator), and append counter (configurable separator, first number, and digit width). Rules run top to bottom, and the rule list shows each rule’s current settings. The preview is **not** live: it updates only when you run Scan or Refresh preview, and Apply always executes the most recent preview — refresh after changing any rule before applying. A change-extension rule with a blank extension removes the extension. The desktop shell applies renames only — copy and move exist in the core API but are not exposed in the UI.
+- Saves the ordered rule stack as a named **preset** and loads it again later or on another machine. Presets are versioned JSON files that contain only rules — never file paths — so loading one cannot point the app at a folder you did not choose. Saving writes through a temporary file plus a rename, so an interrupted save cannot leave a half-written preset, and a preset can be deleted from the shell behind a confirmation.
 - Makes numbering order explicit (the **Order Observatory**): the shell offers Path, Name, Modified (oldest first), and Capture date (oldest first, from JPEG Exif) as the numbering/processing order, states the chosen order and the assigned counter range with every preview, and records the order in the plan and journal. Every order falls back to the stable path key on ties. The planner also warns about possible **sequence gaps** — holes in a numbered pattern (for example `IMG_0001, IMG_0002, IMG_0004`) in the proposed names; a gap is a warning, never a block, because it can be legitimate.
 - Validates empty names, invalid Windows filename characters, reserved DOS device names, trailing spaces/dots, the 255 UTF-16 code-unit filename-component limit, a conservative legacy path-length limit (destination paths over 259 UTF-16 code units are blocked), duplicate targets, and existing unselected targets.
 - Runs planning and filesystem work off the UI event loop.
@@ -25,7 +26,7 @@
 - Native file/folder picker and drag-and-drop intake (paste a path in the current shell). One folder is scanned per preview.
 - Per-row inclusion/exclusion, issue filters, sortable columns, and thumbnails.
 - Copy/move destination templates. `OperationKind::Copy` and `OperationKind::Move` exist in the core API, but the shell always plans renames.
-- CSV/JSON mapping, saved rule presets, and report export. These have **no implementation yet**, in the core or the UI. The rule stack lives only in memory, so it is gone when the app closes; an exported plan file records it for that plan only.
+- CSV/JSON mapping and report export. These have **no implementation yet**, in the core or the UI. Presets store a rule stack only; they do not record which folder or files a job targeted.
 - A shell for the plan handoff core (`PlanFile`/`DriftReport`). Export, revalidation, and subset selection exist in the library and its tests, but there are no Save plan / Open plan controls yet.
 - Folder mutation, watched folders, Explorer context menu, portable-data mode, CLI automation, hash/duplicate analysis, metadata writing, document-content classification, integrations, and networking.
 - Stable Windows file IDs for rollback. This build uses a conservative size + modification-time fingerprint, so it may reject safe recovery and cannot prove identity against an adversarial or coincidental replacement.
@@ -58,7 +59,7 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (32 unit tests), and several validation paths are currently covered by code inspection only.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (42 unit tests), and several validation paths are currently covered by code inspection only.
 
 During development on a supported desktop platform:
 
@@ -84,6 +85,7 @@ Cross-volume moves cannot be atomic. They are implemented as copy → byte-count
 - **Windows location:** `%LOCALAPPDATA%\FileWeaver\operations.sqlite`
 - **Other development platforms:** `$XDG_STATE_HOME/FileWeaver/operations.sqlite`, then `~/.local/state/FileWeaver/operations.sqlite`
 - The path is resolved from the first of those variables that is set (on Windows, if `LOCALAPPDATA` is unset the same fallback chain applies). If none is set, the ledger is created relative to the process working directory as `./FileWeaver/operations.sqlite`.
+- **Presets:** `<same FileWeaver folder>\presets\*.json` (or `presets/*.json` on other development platforms), one file per saved rule stack. Each file records a format tag, a format version, the app version, the preset name, and the rule pipeline. The build refuses a preset whose version it does not understand instead of guessing.
 - The current build has no networking, telemetry, update checking, account, synchronization, upload, or online metadata lookup.
 - The operation ledger contains file paths and outcome metadata. Treat it as sensitive. The ledger uses SQLite's WAL mode, so `operations.sqlite-wal` and `operations.sqlite-shm` may sit alongside it while the app runs; close the app before copying it as a backup so all state is folded back into the main file. Deleting it removes rollback history.
 
@@ -96,6 +98,7 @@ src/rules.rs      Deterministic pure naming-rule pipeline
 src/metadata.rs   Narrow JPEG/Exif reader that tolerates malformed files
 src/planner.rs    Non-destructive scan, stable order, validation, collision detection
 src/journal.rs    SQLite operation ledger
+src/presets.rs    Versioned rule-preset format and atomic preset store
 src/executor.rs   Staged execution, cancellation, conservative rollback
 src/main.rs       Slint desktop integration and background work scheduling
 build.rs          Compiles ui/main.slint into the binary via slint-build
@@ -109,6 +112,8 @@ ui/main.slint     Accessible desktop shell
 | **Apply is disabled** | The preview has blocking issues, no changes, or no folder was scanned. Read each row’s status; the initial UI needs better issue filtering. |
 | **A path is not scanned** | Check spelling, access permissions, and whether it is a symbolic link. The current build deliberately skips symlinks/reparse-point-like links. |
 | **“Target appeared after preview”** | Another program changed the folder after planning. Refresh the preview; the executor refuses to overwrite it. |
+| **A saved preset is missing from the list** | The file was unreadable or not a FileWeaver preset; the preset panel names the first skipped files. Presets live in the `presets` folder next to the operation ledger. |
+| **A preset save fails** | Check that the state folder is writable; the status line reports the file error. Saving never modifies your files. |
 | **Recovery skips a file** | The destination’s size/modification fingerprint differs from the recorded post-operation result, or its original location is occupied. The Recovery ledger’s review shows which files are unchanged, changed, or missing before you roll back; preserve both files and resolve skipped ones manually. |
 | **Behaviour on Linux/macOS** | Not a supported platform. The core and shell compile there and the core tests pass, which is useful during development, but the Windows filename rules and the Windows UX are neither meaningful nor validated off Windows. |
 
