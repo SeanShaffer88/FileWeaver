@@ -19,18 +19,13 @@ slint::include_modules!();
 
 /// Preview table filter. `Changes` and `Warnings` describe what would happen
 /// to a row, independent of whether the user has excluded it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PreviewFilter {
+    #[default]
     All,
     Changes,
     Blocked,
     Warnings,
-}
-
-impl Default for PreviewFilter {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl PreviewFilter {
