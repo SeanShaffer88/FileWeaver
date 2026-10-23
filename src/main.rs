@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use fileweaver_core::{
-    CancellationToken, CollisionPolicy, Divergence, ExecuteError, ExecuteProgress, Executor,
-    JobReview, JobSummary, Journal, JournalError, OperationKind, PlanRequest, PlannedJob,
-    RollbackReport, Rule, RulePipeline, SortOrder, plan,
+    CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, ExecuteError,
+    ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError, OperationKind,
+    PlanRequest, PlannedJob, RollbackReport, Rule, RulePipeline, SortOrder, plan,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -18,6 +18,10 @@ slint::include_modules!();
 #[derive(Default)]
 struct AppState {
     plan: Mutex<Option<PlannedJob>>,
+    /// The ordered rule stack shown in the shell. This is the single source of
+    /// truth for the next preview; the UI only edits it.
+    rules: Mutex<Vec<Rule>>,
+    selected_rule: Mutex<Option<usize>>,
     cancellation: Mutex<Option<CancellationToken>>,
     ledger_job_ids: Mutex<Vec<i64>>,
     selected_job_id: Mutex<Option<i64>>,
@@ -109,6 +113,149 @@ fn main() -> Result<(), slint::PlatformError> {
         move || schedule_rollback(weak.clone(), Arc::clone(&state))
     });
 
+    ui.on_add_rule({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |kind| {
+            let rule = default_rule_for_kind(kind);
+            let index = match state.rules.lock() {
+                Ok(mut rules) => {
+                    rules.push(rule);
+                    rules.len() - 1
+                }
+                Err(_) => return,
+            };
+            if let Ok(mut selected) = state.selected_rule.lock() {
+                *selected = Some(index);
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_rule_ui(&ui, &state);
+                clear_preview(&state, &ui);
+            }
+        }
+    });
+
+    ui.on_remove_rule({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(index) = selected_rule(&state) else {
+                return;
+            };
+            let mut next_selection = None;
+            {
+                let Ok(mut rules) = state.rules.lock() else {
+                    return;
+                };
+                if index >= rules.len() {
+                    return;
+                }
+                rules.remove(index);
+                if !rules.is_empty() {
+                    next_selection = Some(index.min(rules.len() - 1));
+                }
+            }
+            if let Ok(mut selected) = state.selected_rule.lock() {
+                *selected = next_selection;
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_rule_ui(&ui, &state);
+                clear_preview(&state, &ui);
+            }
+        }
+    });
+
+    ui.on_move_rule_up({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(index) = selected_rule(&state) else {
+                return;
+            };
+            if index == 0 {
+                return;
+            }
+            match state.rules.lock() {
+                Ok(mut rules) if index < rules.len() => rules.swap(index - 1, index),
+                _ => return,
+            }
+            if let Ok(mut selected) = state.selected_rule.lock() {
+                *selected = Some(index - 1);
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_rule_rows(&ui, &state);
+                clear_preview(&state, &ui);
+            }
+        }
+    });
+
+    ui.on_move_rule_down({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(index) = selected_rule(&state) else {
+                return;
+            };
+            match state.rules.lock() {
+                Ok(mut rules) if index + 1 < rules.len() => rules.swap(index, index + 1),
+                _ => return,
+            }
+            if let Ok(mut selected) = state.selected_rule.lock() {
+                *selected = Some(index + 1);
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_rule_rows(&ui, &state);
+                clear_preview(&state, &ui);
+            }
+        }
+    });
+
+    ui.on_select_rule({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            match state.rules.lock() {
+                Ok(rules) if index < rules.len() => {}
+                _ => return,
+            }
+            if let Ok(mut selected) = state.selected_rule.lock() {
+                *selected = Some(index);
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_rule_ui(&ui, &state);
+            }
+        }
+    });
+
+    ui.on_editor_changed({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(index) = selected_rule(&state) else {
+                return;
+            };
+            let updated = {
+                let Ok(mut rules) = state.rules.lock() else {
+                    return;
+                };
+                let Some(rule) = rules.get_mut(index) else {
+                    return;
+                };
+                apply_editor_to_rule(&ui, rule);
+                rule.clone()
+            };
+            ui.set_editor_hint(editor_hint(&updated).into());
+            refresh_rule_rows(&ui, &state);
+            clear_preview(&state, &ui);
+        }
+    });
+
     // Initial history load is synchronous: it is a small bounded read, and
     // the event loop is not running yet to receive a posted update.
     match Journal::open(operation_ledger_path()).and_then(|journal| journal.list_jobs(20)) {
@@ -127,25 +274,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = Arc::clone(&state);
         let weak = ui.as_weak();
         move || {
-            // Any edit to the folder or rules invalidates the stored preview:
-            // the plan it produced must never be applied as if it were current.
-            let had_plan = match state.plan.lock() {
-                Ok(mut guard) => guard.take().is_some(),
-                Err(_) => false,
-            };
-            if had_plan && let Some(ui) = weak.upgrade() {
-                ui.set_can_apply(false);
-                ui.set_risk_budget("".into());
-                ui.set_order_summary("".into());
-                ui.set_selected_row_index(-1);
-                ui.set_provenance("".into());
-                ui.set_status(
-                    "Settings changed since the preview. Select Refresh preview to review the updated plan before applying."
-                        .into(),
-                );
+            // Any edit to the folder or numbering order invalidates the stored
+            // preview: the plan it produced must never be applied as if it
+            // were current.
+            if let Some(ui) = weak.upgrade() {
+                clear_preview(&state, &ui);
             }
         }
     });
+
+    refresh_rule_ui(&ui, &state);
 
     ui.run()
 }
@@ -184,8 +322,41 @@ fn inputs_match(plan: &PlannedJob, request: &PlanRequest, pipeline: &RulePipelin
         && pipeline_json.as_deref() == Some(plan.pipeline_json.as_str())
 }
 
-fn plan_is_current(plan: &PlannedJob, ui: &MainWindow) -> bool {
-    inputs_match(plan, &request_from_ui(ui), &pipeline_from_ui(ui))
+fn plan_is_current(plan: &PlannedJob, ui: &MainWindow, state: &AppState) -> bool {
+    inputs_match(plan, &request_from_ui(ui), &current_pipeline(state))
+}
+
+/// Snapshot of the ordered rule stack, which is the pipeline the next preview
+/// will use. A poisoned lock yields an empty stack rather than a panic: the
+/// preview then cannot match any stored plan, which fails safe.
+fn current_pipeline(state: &AppState) -> RulePipeline {
+    RulePipeline {
+        rules: current_rules(state),
+    }
+}
+
+fn selected_rule(state: &AppState) -> Option<usize> {
+    state.selected_rule.lock().ok().and_then(|guard| *guard)
+}
+
+/// Discards the stored preview after any input change, so a plan built from
+/// settings the user no longer sees can never be applied.
+fn clear_preview(state: &AppState, ui: &MainWindow) {
+    let had_plan = match state.plan.lock() {
+        Ok(mut guard) => guard.take().is_some(),
+        Err(_) => false,
+    };
+    if had_plan {
+        ui.set_can_apply(false);
+        ui.set_risk_budget("".into());
+        ui.set_order_summary("".into());
+        ui.set_selected_row_index(-1);
+        ui.set_provenance("".into());
+        ui.set_status(
+            "Settings changed since the preview. Select Refresh preview to review the updated plan before applying."
+                .into(),
+        );
+    }
 }
 
 fn schedule_preview(
@@ -203,8 +374,7 @@ fn schedule_preview(
         return;
     }
 
-    let pipeline = pipeline_from_ui(&ui);
-    let counter_enabled = ui.get_add_counter();
+    let pipeline = current_pipeline(&state);
     let request = request_from_ui(&ui);
     ui.set_can_apply(false);
     ui.set_risk_budget("".into());
@@ -220,14 +390,18 @@ fn schedule_preview(
         .into(),
     );
 
+    // The ordering summary needs the pipeline's counter settings; keep a copy
+    // because the pipeline itself is borrowed by the planning call.
+    let summary_pipeline = pipeline.clone();
     thread::spawn(move || match plan(request, &pipeline) {
         Ok(new_plan) => {
             let rows = rows_for_plan(&new_plan);
             let summary = summary_text(&new_plan);
             let risk_budget = risk_budget_text(&new_plan);
-            let order_summary = order_summary_text(&new_plan, counter_enabled);
+            let order_summary = order_summary_text(&new_plan, &summary_pipeline);
             let executable = new_plan.is_executable();
             let plan_for_check = new_plan.clone();
+            let state_for_check = Arc::clone(&state);
             if let Ok(mut current) = state.plan.lock() {
                 *current = Some(new_plan);
             }
@@ -237,7 +411,7 @@ fn schedule_preview(
                 // built on the worker thread; only present the plan as
                 // applicable if it still matches what the user now sees.
                 // (Apply re-validates regardless, as a final guard.)
-                if plan_is_current(&plan_for_check, &ui) {
+                if plan_is_current(&plan_for_check, &ui, &state_for_check) {
                     ui.set_status(summary.into());
                     ui.set_risk_budget(risk_budget.into());
                     ui.set_order_summary(order_summary.into());
@@ -248,6 +422,11 @@ fn schedule_preview(
                     );
                     ui.set_can_apply(executable);
                 } else {
+                    // The result no longer matches the visible settings, so it
+                    // must not remain available to Apply either.
+                    if let Ok(mut stored) = state_for_check.plan.lock() {
+                        *stored = None;
+                    }
                     ui.set_status(
                         "Settings changed while the preview was building. Select Refresh preview to review the updated plan before applying."
                             .into(),
@@ -290,7 +469,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     // what the user sees, even if an input change somehow reached Apply
     // without invalidating the preview first.
     if let Some(ui) = weak.upgrade()
-        && !plan_is_current(&plan, &ui)
+        && !plan_is_current(&plan, &ui, &state)
     {
         if let Ok(mut guard) = state.plan.lock() {
             *guard = None;
@@ -385,28 +564,333 @@ fn update_progress(weak: &slint::Weak<MainWindow>, event: ExecuteProgress) {
     });
 }
 
-fn pipeline_from_ui(ui: &MainWindow) -> RulePipeline {
-    let mut rules = Vec::new();
-    if !ui.get_prefix().is_empty() {
-        rules.push(Rule::AddPrefix {
-            text: ui.get_prefix().to_string(),
-        });
-    }
-    if !ui.get_find_text().is_empty() {
-        rules.push(Rule::ReplaceText {
-            find: ui.get_find_text().to_string(),
-            replacement: ui.get_replace_text().to_string(),
+fn current_rules(state: &AppState) -> Vec<Rule> {
+    state
+        .rules
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// The rule kind indices are a UI contract: they index the "Rule type to add"
+/// combo box in `ui/main.slint`. Keep both in the same order.
+fn default_rule_for_kind(kind: i32) -> Rule {
+    match kind {
+        1 => Rule::AddSuffixBeforeExtension {
+            text: String::new(),
+        },
+        2 => Rule::ReplaceText {
+            find: String::new(),
+            replacement: String::new(),
             replace_all: true,
-        });
-    }
-    if ui.get_add_counter() {
-        rules.push(Rule::AppendCounter {
+        },
+        3 => Rule::ReplaceRegex {
+            pattern: String::new(),
+            replacement: String::new(),
+        },
+        4 => Rule::ChangeCase {
+            style: CaseStyle::Lower,
+        },
+        5 => Rule::TrimAndCollapseWhitespace,
+        6 => Rule::ChangeExtension {
+            extension: String::new(),
+        },
+        7 => Rule::PrefixDate {
+            source: DateSource::ModifiedTime,
+            format: "[year]-[month]-[day]".into(),
+            separator: "_".into(),
+        },
+        8 => Rule::AppendCounter {
             separator: "_".into(),
             start_at: 1,
             width: 4,
-        });
+        },
+        _ => Rule::AddPrefix {
+            text: String::new(),
+        },
     }
-    RulePipeline { rules }
+}
+
+fn rule_kind_index(rule: &Rule) -> i32 {
+    match rule {
+        Rule::AddPrefix { .. } => 0,
+        Rule::AddSuffixBeforeExtension { .. } => 1,
+        Rule::ReplaceText { .. } => 2,
+        Rule::ReplaceRegex { .. } => 3,
+        Rule::ChangeCase { .. } => 4,
+        Rule::TrimAndCollapseWhitespace => 5,
+        Rule::ChangeExtension { .. } => 6,
+        Rule::PrefixDate { .. } => 7,
+        Rule::AppendCounter { .. } => 8,
+    }
+}
+
+fn case_style_from_index(index: i32) -> CaseStyle {
+    match index {
+        1 => CaseStyle::Upper,
+        2 => CaseStyle::Title,
+        _ => CaseStyle::Lower,
+    }
+}
+
+fn case_style_to_index(style: CaseStyle) -> i32 {
+    match style {
+        CaseStyle::Lower => 0,
+        CaseStyle::Upper => 1,
+        CaseStyle::Title => 2,
+    }
+}
+
+fn date_source_from_index(index: i32) -> DateSource {
+    match index {
+        1 => DateSource::JpegCaptureTime,
+        _ => DateSource::ModifiedTime,
+    }
+}
+
+fn date_source_to_index(source: DateSource) -> i32 {
+    match source {
+        DateSource::ModifiedTime => 0,
+        DateSource::JpegCaptureTime => 1,
+    }
+}
+
+fn date_source_label(source: DateSource) -> &'static str {
+    match source {
+        DateSource::ModifiedTime => "modified time",
+        DateSource::JpegCaptureTime => "JPEG capture date",
+    }
+}
+
+fn rule_summary(rule: &Rule) -> String {
+    match rule {
+        Rule::AddPrefix { text } => format!("adds “{text}” at the start"),
+        Rule::AddSuffixBeforeExtension { text } => {
+            format!("adds “{text}” before the extension")
+        }
+        Rule::ReplaceText {
+            find,
+            replacement,
+            replace_all,
+        } => format!(
+            "“{find}” → “{replacement}” ({})",
+            if *replace_all {
+                "every match"
+            } else {
+                "first match"
+            }
+        ),
+        Rule::ReplaceRegex {
+            pattern,
+            replacement,
+        } => format!("regex “{pattern}” → “{replacement}”"),
+        Rule::ChangeCase { style } => format!("whole name to {style}"),
+        Rule::TrimAndCollapseWhitespace => "trims and collapses spaces".to_owned(),
+        Rule::ChangeExtension { extension } => {
+            let cleaned = extension.trim().trim_start_matches('.');
+            if cleaned.is_empty() {
+                "removes the extension".to_owned()
+            } else {
+                format!("extension → .{cleaned}")
+            }
+        }
+        Rule::PrefixDate {
+            source,
+            format,
+            separator,
+        } => format!(
+            "{format} from {} then “{separator}”",
+            date_source_label(*source)
+        ),
+        Rule::AppendCounter {
+            separator,
+            start_at,
+            width,
+        } => format!("“{separator}” + numbers from {start_at}, {width} digits"),
+    }
+}
+
+/// Short, rule-specific note under the editor fields. These carry information
+/// the controls themselves cannot: what the rule needs, and what blocks Apply.
+fn editor_hint(rule: &Rule) -> String {
+    match rule {
+        Rule::ReplaceText { .. } => {
+            "Literal text, not a pattern. Use Replace regex for patterns.".to_owned()
+        }
+        Rule::ReplaceRegex { .. } => {
+            "Rust regular expression syntax. An invalid pattern blocks Apply and is reported in the preview."
+                .to_owned()
+        }
+        Rule::ChangeExtension { .. } => {
+            "The final extension is replaced. A leading dot is optional; a blank value removes the extension."
+                .to_owned()
+        }
+        Rule::PrefixDate {
+            source: DateSource::JpegCaptureTime,
+            ..
+        } => "Needs a JPEG Exif capture date. JPEGs without one are blocked with an explanation; other file types never have one."
+            .to_owned(),
+        Rule::PrefixDate { .. } => {
+            "Uses each file’s filesystem modified time. Dates are formatted in UTC so the names are reproducible."
+                .to_owned()
+        }
+        Rule::AppendCounter { .. } => {
+            "Numbers are assigned in the numbering order chosen below, across every file in the plan."
+                .to_owned()
+        }
+        Rule::ChangeCase { .. } => {
+            "Applies to the whole name, including the extension.".to_owned()
+        }
+        Rule::AddPrefix { .. } => "Blank text changes nothing.".to_owned(),
+        Rule::AddSuffixBeforeExtension { .. } => {
+            "Inserted before the final extension; a blank value changes nothing.".to_owned()
+        }
+        Rule::TrimAndCollapseWhitespace => String::new(),
+    }
+}
+
+fn rule_rows(rules: &[Rule]) -> Vec<RuleRow> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| RuleRow {
+            position: format!("{}.", index + 1).into(),
+            label: rule.label().into(),
+            summary: rule_summary(rule).into(),
+        })
+        .collect()
+}
+
+/// Rebuilds the rule list display and clamps the selection to it. It never
+/// rewrites the editor fields, so typing is not interrupted.
+fn refresh_rule_rows(ui: &MainWindow, state: &AppState) {
+    let rules = current_rules(state);
+    ui.set_rule_rows(ModelRc::new(Rc::new(VecModel::from(rule_rows(&rules)))));
+    let selected = selected_rule(state).filter(|index| *index < rules.len());
+    if let Ok(mut guard) = state.selected_rule.lock() {
+        *guard = selected;
+    }
+    ui.set_selected_rule_index(match selected {
+        Some(index) => i32::try_from(index).unwrap_or(-1),
+        None => -1,
+    });
+}
+
+/// Refreshes the rule list and loads the selected rule into the editor.
+fn refresh_rule_ui(ui: &MainWindow, state: &AppState) {
+    refresh_rule_rows(ui, state);
+    let rule = selected_rule(state).and_then(|index| current_rules(state).get(index).cloned());
+    match rule {
+        Some(rule) => push_rule_to_editor(ui, &rule),
+        None => {
+            ui.set_selected_rule_index(-1);
+            ui.set_editor_kind(-1);
+            ui.set_editor_hint("".into());
+        }
+    }
+}
+
+fn push_rule_to_editor(ui: &MainWindow, rule: &Rule) {
+    ui.set_editor_kind(rule_kind_index(rule));
+    match rule {
+        Rule::AddPrefix { text } | Rule::AddSuffixBeforeExtension { text } => {
+            ui.set_editor_text(text.clone().into());
+        }
+        Rule::ReplaceText {
+            find,
+            replacement,
+            replace_all,
+        } => {
+            ui.set_editor_find(find.clone().into());
+            ui.set_editor_replacement(replacement.clone().into());
+            ui.set_editor_replace_all(*replace_all);
+        }
+        Rule::ReplaceRegex {
+            pattern,
+            replacement,
+        } => {
+            ui.set_editor_find(pattern.clone().into());
+            ui.set_editor_replacement(replacement.clone().into());
+        }
+        Rule::ChangeCase { style } => ui.set_editor_case_index(case_style_to_index(*style)),
+        Rule::TrimAndCollapseWhitespace => {}
+        Rule::ChangeExtension { extension } => {
+            ui.set_editor_extension(extension.clone().into());
+        }
+        Rule::PrefixDate {
+            source,
+            format,
+            separator,
+        } => {
+            ui.set_editor_date_source_index(date_source_to_index(*source));
+            ui.set_editor_date_format(format.clone().into());
+            ui.set_editor_date_separator(separator.clone().into());
+        }
+        Rule::AppendCounter {
+            separator,
+            start_at,
+            width,
+        } => {
+            ui.set_editor_counter_separator(separator.clone().into());
+            ui.set_editor_counter_start(i32::try_from(*start_at).unwrap_or(1));
+            ui.set_editor_counter_width(i32::from(*width));
+        }
+    }
+    ui.set_editor_hint(editor_hint(rule).into());
+}
+
+/// Copies every editor field into the selected rule. Fields that do not belong
+/// to the selected rule kind are ignored, because the shell only shows the
+/// controls that apply.
+fn apply_editor_to_rule(ui: &MainWindow, rule: &mut Rule) {
+    match rule {
+        Rule::AddPrefix { text } | Rule::AddSuffixBeforeExtension { text } => {
+            *text = ui.get_editor_text().to_string();
+        }
+        Rule::ReplaceText {
+            find,
+            replacement,
+            replace_all,
+        } => {
+            *find = ui.get_editor_find().to_string();
+            *replacement = ui.get_editor_replacement().to_string();
+            *replace_all = ui.get_editor_replace_all();
+        }
+        Rule::ReplaceRegex {
+            pattern,
+            replacement,
+        } => {
+            *pattern = ui.get_editor_find().to_string();
+            *replacement = ui.get_editor_replacement().to_string();
+        }
+        Rule::ChangeCase { style } => *style = case_style_from_index(ui.get_editor_case_index()),
+        Rule::TrimAndCollapseWhitespace => {}
+        Rule::ChangeExtension { extension } => {
+            *extension = ui.get_editor_extension().to_string();
+        }
+        Rule::PrefixDate {
+            source,
+            format,
+            separator,
+        } => {
+            *source = date_source_from_index(ui.get_editor_date_source_index());
+            *format = ui.get_editor_date_format().to_string();
+            *separator = ui.get_editor_date_separator().to_string();
+        }
+        Rule::AppendCounter {
+            separator,
+            start_at,
+            width,
+        } => {
+            *separator = ui.get_editor_counter_separator().to_string();
+            *start_at = u64::try_from(ui.get_editor_counter_start())
+                .unwrap_or(1)
+                .max(1);
+            *width = u8::try_from(ui.get_editor_counter_width())
+                .unwrap_or(4)
+                .clamp(1, 9);
+        }
+    }
 }
 
 fn rows_for_plan(plan: &PlannedJob) -> Vec<PreviewRow> {
@@ -742,8 +1226,8 @@ fn schedule_rollback(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
 }
 
 /// The value of the last digit run in a proposed name's stem, when that run
-/// is exactly four digits (the shell's fixed counter width).
-fn counter_value(proposed_name: &str) -> Option<u64> {
+/// is exactly `width` digits — the width the counter rule was configured with.
+fn counter_value(proposed_name: &str, width: usize) -> Option<u64> {
     let stem = match proposed_name.rfind('.') {
         Some(dot) if dot > 0 => &proposed_name[..dot],
         _ => proposed_name,
@@ -763,27 +1247,38 @@ fn counter_value(proposed_name: &str) -> Option<u64> {
         }
     }
     let (start, end) = run?;
-    if end - start != 4 {
+    if end - start != width {
         return None;
     }
     stem[start..end].parse().ok()
 }
 
-fn order_summary_text(plan: &PlannedJob, counter_enabled: bool) -> String {
+fn order_summary_text(plan: &PlannedJob, pipeline: &RulePipeline) -> String {
     let mut text = format!(
         "Order: {} · {} file(s) in this order.",
         plan.request.sort.label(),
         plan.summary.discovered
     );
-    if counter_enabled {
+    let counter = pipeline.rules.iter().find_map(|rule| match rule {
+        Rule::AppendCounter {
+            separator, width, ..
+        } => Some((separator.as_str(), usize::from(*width))),
+        _ => None,
+    });
+    if let Some((separator, width)) = counter {
         let values: Vec<u64> = plan
             .actions
             .iter()
             .filter(|action| action.will_change())
-            .filter_map(|action| counter_value(&action.proposed_name))
+            .filter_map(|action| counter_value(&action.proposed_name, width))
             .collect();
         if let (Some(min), Some(max)) = (values.iter().min(), values.iter().max()) {
-            text.push_str(&format!(" Assigned counters run _{min:04} to _{max:04}."));
+            let formatted = |value: u64| format!("{:0width$}", value, width = width);
+            text.push_str(&format!(
+                " Assigned counters run {separator}{} to {separator}{}.",
+                formatted(*min),
+                formatted(*max)
+            ));
         }
     }
     for gap in plan.sequence_gaps.iter().take(2) {
@@ -919,6 +1414,72 @@ mod tests {
         assert_eq!(
             provenance_text(&planned.actions[0]),
             "photo.txt — no rules in the pipeline, so the name is unchanged."
+        );
+    }
+
+    #[test]
+    fn every_rule_kind_round_trips_through_the_shell_index() {
+        for kind in 0..9 {
+            let rule = default_rule_for_kind(kind);
+            assert_eq!(rule_kind_index(&rule), kind);
+            assert!(!rule_summary(&rule).is_empty());
+        }
+    }
+
+    #[test]
+    fn case_and_date_choices_round_trip() {
+        for index in 0..3 {
+            assert_eq!(case_style_to_index(case_style_from_index(index)), index);
+        }
+        for index in 0..2 {
+            assert_eq!(date_source_to_index(date_source_from_index(index)), index);
+        }
+    }
+
+    #[test]
+    fn rule_stack_is_the_pipeline_used_for_the_next_preview() {
+        let state = AppState::default();
+        assert!(current_pipeline(&state).rules.is_empty());
+        if let Ok(mut rules) = state.rules.lock() {
+            rules.push(default_rule_for_kind(5));
+        }
+        let pipeline = current_pipeline(&state);
+        assert_eq!(pipeline.rules.len(), 1);
+        assert!(matches!(
+            pipeline.rules.first(),
+            Some(Rule::TrimAndCollapseWhitespace)
+        ));
+    }
+
+    #[test]
+    fn counter_summary_reads_the_configured_width() {
+        assert_eq!(counter_value("photo_0007.jpg", 4), Some(7));
+        assert_eq!(counter_value("photo_07.jpg", 4), None);
+        assert_eq!(counter_value("photo_07.jpg", 2), Some(7));
+    }
+
+    #[test]
+    fn counter_summary_states_the_assigned_range() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["one.txt", "two.txt"] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AppendCounter {
+                separator: "-".into(),
+                start_at: 3,
+                width: 2,
+            }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        let summary = order_summary_text(&planned, &pipeline);
+        assert!(
+            summary.contains("Assigned counters run -03 to -04"),
+            "{summary}"
         );
     }
 }

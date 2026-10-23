@@ -23,4 +23,4 @@ pub use executor::{
 pub use handoff::{DriftReport, DriftState, HandoffAction, HandoffError, PlanFile, RowDrift};
 pub use journal::{JobSummary, Journal, JournalError, RollbackReport};
 pub use planner::{PlanError, plan, subset_plan};
-pub use rules::{Rule, RulePipeline, RuleProblem};
+pub use rules::{CaseStyle, DateSource, Rule, RulePipeline, RuleProblem};

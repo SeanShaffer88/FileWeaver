@@ -33,6 +33,12 @@ pub enum Rule {
     ChangeCase {
         style: CaseStyle,
     },
+    /// Replaces the final extension. An empty (or dot-only) extension removes
+    /// it. A leading dot in the value is ignored so both `jpg` and `.jpg`
+    /// mean the same thing.
+    ChangeExtension {
+        extension: String,
+    },
     AppendCounter {
         separator: String,
         start_at: u64,
@@ -143,6 +149,7 @@ fn apply_rule(
             Ok(current.split_whitespace().collect::<Vec<_>>().join(" "))
         }
         Rule::ChangeCase { style } => Ok(change_case(&current, *style)),
+        Rule::ChangeExtension { extension } => Ok(change_extension(&current, extension)),
         Rule::AppendCounter {
             separator,
             start_at,
@@ -209,6 +216,22 @@ fn insert_before_extension(name: &str, suffix: &str) -> String {
     }
 }
 
+/// Replaces (or removes) the final extension. Files without an extension, and
+/// dot-files such as `.gitignore`, are treated as having only a stem, so
+/// changing their extension appends one instead of eating the leading dot.
+fn change_extension(name: &str, extension: &str) -> String {
+    let cleaned = extension.trim().trim_start_matches('.');
+    let stem = match name.rfind('.') {
+        Some(position) if position > 0 => &name[..position],
+        _ => name,
+    };
+    if cleaned.is_empty() {
+        stem.to_owned()
+    } else {
+        format!("{stem}.{cleaned}")
+    }
+}
+
 fn change_case(value: &str, style: CaseStyle) -> String {
     match style {
         CaseStyle::Lower => value.to_lowercase(),
@@ -243,6 +266,7 @@ impl Rule {
             Self::AddSuffixBeforeExtension { .. } => "Add suffix".to_owned(),
             Self::TrimAndCollapseWhitespace => "Trim whitespace".to_owned(),
             Self::ChangeCase { .. } => "Change case".to_owned(),
+            Self::ChangeExtension { .. } => "Change extension".to_owned(),
             Self::AppendCounter { .. } => "Append counter".to_owned(),
             Self::PrefixDate { .. } => "Prefix date".to_owned(),
         }
@@ -306,5 +330,42 @@ mod tests {
             pipeline.validate(),
             Err(RuleProblem::InvalidRegex(_))
         ));
+    }
+
+    #[test]
+    fn extension_change_replaces_only_the_final_extension() {
+        let pipeline = RulePipeline {
+            rules: vec![Rule::ChangeExtension {
+                extension: ".jpeg".into(),
+            }],
+        };
+        assert_eq!(
+            pipeline.apply(&snapshot("archive.tar.gz"), 0).unwrap().0,
+            "archive.tar.jpeg"
+        );
+    }
+
+    #[test]
+    fn empty_extension_removes_it_and_dot_files_keep_their_stem() {
+        let remove = RulePipeline {
+            rules: vec![Rule::ChangeExtension {
+                extension: String::new(),
+            }],
+        };
+        assert_eq!(remove.apply(&snapshot("photo.jpg"), 0).unwrap().0, "photo");
+        assert_eq!(
+            remove.apply(&snapshot(".gitignore"), 0).unwrap().0,
+            ".gitignore"
+        );
+
+        let add = RulePipeline {
+            rules: vec![Rule::ChangeExtension {
+                extension: "txt".into(),
+            }],
+        };
+        assert_eq!(
+            add.apply(&snapshot(".gitignore"), 0).unwrap().0,
+            ".gitignore.txt"
+        );
     }
 }

@@ -7,7 +7,7 @@
 ## What this build does
 
 - Scans a folder without changing anything. By default only files directly in the selected folder are included; with **Include subfolders** enabled, the scan covers the entire folder tree at any depth.
-- Builds a preview for literal prefix, literal replacement, and counter rules. The preview is **not** live: it updates only when you run Scan or Refresh preview, and Apply always executes the most recent preview — refresh after changing any rule before applying. In the shell the counter is fixed (underscore separator, starting at 1, four digits); the core rule accepts other separators, starts, and widths. The desktop shell applies renames only — copy and move exist in the core API but are not exposed in the UI.
+- Builds a preview from a **user-ordered rule stack**. The shell can add, select, reorder, edit, and remove these rules: add prefix, add suffix before the extension, literal replace (first or every match), regular-expression replace, change case, trim/collapse whitespace, change extension, date prefix (filesystem modified time or JPEG Exif capture date, with a configurable `time` format and separator), and append counter (configurable separator, first number, and digit width). Rules run top to bottom, and the rule list shows each rule’s current settings. The preview is **not** live: it updates only when you run Scan or Refresh preview, and Apply always executes the most recent preview — refresh after changing any rule before applying. A change-extension rule with a blank extension removes the extension. The desktop shell applies renames only — copy and move exist in the core API but are not exposed in the UI.
 - Makes numbering order explicit (the **Order Observatory**): the shell offers Path, Name, Modified (oldest first), and Capture date (oldest first, from JPEG Exif) as the numbering/processing order, states the chosen order and the assigned counter range with every preview, and records the order in the plan and journal. Every order falls back to the stable path key on ties. The planner also warns about possible **sequence gaps** — holes in a numbered pattern (for example `IMG_0001, IMG_0002, IMG_0004`) in the proposed names; a gap is a warning, never a block, because it can be legitimate.
 - Validates empty names, invalid Windows filename characters, reserved DOS device names, trailing spaces/dots, the 255 UTF-16 code-unit filename-component limit, a conservative legacy path-length limit (destination paths over 259 UTF-16 code units are blocked), duplicate targets, and existing unselected targets.
 - Runs planning and filesystem work off the UI event loop.
@@ -17,15 +17,16 @@
 - Shows a **Risk Budget** line with every preview: how many files will change, are blocked, need review, or stay unchanged — and that the plan overwrites nothing.
 - Provides a **Recovery ledger** panel in the shell: recent jobs can be selected to review how their files look now (unchanged, changed, or missing, using the same fingerprint check rollback performs), then rolled back behind a two-step confirmation. Rollback restores only unchanged files whose original location is still free; changed or missing files are never overwritten.
 - Explains every proposed name: selecting a preview row shows its **rule-stage provenance** — the original name followed by the result of each rule in order (for example `photo.txt → Add prefix: 2026-photo.txt → Append counter: 2026-photo_0001.txt`) — using the stage results the rule engine records when the plan is built.
-- Reads JPEG Exif capture timestamps (`.jpg`/`.jpeg`, `DateTimeOriginal` then `DateTimeDigitized`) while planning. The core date rule can use them; the first UI slice does not expose that rule yet.
+- Reads JPEG Exif capture timestamps (`.jpg`/`.jpeg`, `DateTimeOriginal` then `DateTimeDigitized`) while planning. The date-prefix rule can use either those capture dates or the filesystem modified time, and both sources are selectable in the shell.
 - Exposes Slint accessibility metadata for the implemented controls, keyboard-focusable standard controls, and status text.
 
 ## Intentionally not yet exposed or complete
 
-- Native file/folder picker and drag-and-drop intake (paste a path in the current shell).
+- Native file/folder picker and drag-and-drop intake (paste a path in the current shell). One folder is scanned per preview.
 - Per-row inclusion/exclusion, issue filters, sortable columns, and thumbnails.
-- UI controls for the regex, case, and date/Exif rules and for copy/move destination templates. Those exist in the core API, but none should be represented as complete UI features.
-- CSV/JSON mapping, saved presets, and report export. These have **no implementation yet**, in the core or the UI.
+- Copy/move destination templates. `OperationKind::Copy` and `OperationKind::Move` exist in the core API, but the shell always plans renames.
+- CSV/JSON mapping, saved rule presets, and report export. These have **no implementation yet**, in the core or the UI. The rule stack lives only in memory, so it is gone when the app closes; an exported plan file records it for that plan only.
+- A shell for the plan handoff core (`PlanFile`/`DriftReport`). Export, revalidation, and subset selection exist in the library and its tests, but there are no Save plan / Open plan controls yet.
 - Folder mutation, watched folders, Explorer context menu, portable-data mode, CLI automation, hash/duplicate analysis, metadata writing, document-content classification, integrations, and networking.
 - Stable Windows file IDs for rollback. This build uses a conservative size + modification-time fingerprint, so it may reject safe recovery and cannot prove identity against an adversarial or coincidental replacement.
 - Windows VM testing, real Windows screen-reader testing, high-contrast testing, installer creation, code signing, or clean-machine runtime verification.
@@ -57,7 +58,7 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-There is currently no CI enforcing these commands — they are the contributor's local gate. The automated test suite is small (7 tests), and several validation paths are currently covered by code inspection only.
+There is currently no CI enforcing these commands — they are the contributor's local gate. The automated test suite is small (32 unit tests), and several validation paths are currently covered by code inspection only.
 
 During development on a supported desktop platform:
 
@@ -65,7 +66,7 @@ During development on a supported desktop platform:
 cargo run
 ```
 
-The current shell accepts a manually pasted folder path, optional subfolder scanning, and simple rules. Use a disposable copy of files only: this is an early implementation.
+The current shell accepts a manually pasted folder path, optional subfolder scanning, and an ordered rule stack that is edited in place. Use a disposable copy of files only: this is an early implementation.
 
 ## Safety model
 
