@@ -8,14 +8,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use filenameweaver_core::{
-    CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, ExecuteError,
-    ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError, OperationKind,
-    PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary, RollbackReport, Rule,
-    RulePipeline, SortOrder, plan, subset_plan,
+    CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, DriftReport, DriftState,
+    ExecuteError, ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError,
+    OperationKind, PlanFile, PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary,
+    RollbackReport, Rule, RulePipeline, SortOrder, plan, subset_plan,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
+
+/// A plan file the user opened, together with the drift report produced by
+/// revalidating it against the folder as it exists now.
+#[derive(Clone)]
+struct LoadedHandoff {
+    file: PlanFile,
+    report: DriftReport,
+    path: PathBuf,
+}
 
 #[derive(Default)]
 struct AppState {
@@ -31,6 +40,9 @@ struct AppState {
     /// Presets as last listed from disk, in the order the combo box shows.
     presets: Mutex<Vec<PresetSummary>>,
     cancellation: Mutex<Option<CancellationToken>>,
+    /// A reviewed plan handoff and its drift report, kept so the safe subset
+    /// can be applied without re-reading the file.
+    handoff: Mutex<Option<LoadedHandoff>>,
     ledger_job_ids: Mutex<Vec<i64>>,
     selected_job_id: Mutex<Option<i64>>,
 }
@@ -440,6 +452,215 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_ledger_detail(format!("Could not read the operation ledger: {error}").into());
         }
     }
+
+    ui.on_save_plan({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(plan) = state.plan.lock().ok().and_then(|guard| guard.clone()) else {
+                ui.set_status("Build and review a preview before saving a plan file.".into());
+                return;
+            };
+            let target = handoff_path_for(ui.get_plan_path().trim(), &plan);
+            let pipeline = current_pipeline(&state);
+            ui.set_status("Saving the reviewed plan file…".into());
+            thread::spawn(move || {
+                let file = PlanFile::from_plan(&plan, &pipeline, now_unix_ms());
+                let result = write_atomically(&target, &file.to_json().unwrap_or_default());
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(()) => {
+                        ui.set_plan_path(target.to_string_lossy().to_string().into());
+                        ui.set_can_apply_handoff(false);
+                        ui.set_handoff_rows(ModelRc::new(Rc::new(VecModel::default())));
+                        ui.set_handoff_detail(
+                            format!(
+                                "Saved {} file row(s) to {}. The file records the folder, the rules, and every proposed name — never file contents — so it can be reviewed on another machine.",
+                                plan.actions.len(),
+                                target.display()
+                            )
+                            .into(),
+                        );
+                        ui.set_status(
+                            "Plan file saved. Anyone who opens it sees drift against the folder as it exists then, and can apply only the rows that still check out."
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_status(format!("Could not save the plan file: {error}").into());
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_open_plan({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let path = PathBuf::from(ui.get_plan_path().trim());
+            if path.as_os_str().is_empty() {
+                ui.set_status(
+                    "Enter the path of a .json plan file to review before opening it.".into(),
+                );
+                return;
+            }
+            if let Ok(mut handoff) = state.handoff.lock() {
+                *handoff = None;
+            }
+            ui.set_can_apply_handoff(false);
+            ui.set_handoff_rows(ModelRc::new(Rc::new(VecModel::default())));
+            ui.set_handoff_detail(
+                "Revalidating the plan against the folder as it exists now…".into(),
+            );
+            let state_for_thread = Arc::clone(&state);
+            let path_for_thread = path.clone();
+            thread::spawn(move || {
+                let result = (|| {
+                    let text = std::fs::read_to_string(&path_for_thread)?;
+                    let file = PlanFile::from_json(&text)?;
+                    let report = file.evaluate()?;
+                    Ok::<_, String>((file, report))
+                })();
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok((file, report)) => {
+                        let rows = handoff_rows(&report);
+                        let detail = handoff_detail_text(&file, &report);
+                        let clean = report.count(DriftState::Unchanged);
+                        ui.set_handoff_rows(ModelRc::new(Rc::new(VecModel::from(rows))));
+                        ui.set_handoff_detail(detail.into());
+                        ui.set_can_apply_handoff(clean > 0);
+                        ui.set_status(
+                            format!(
+                                "Plan reviewed: {clean} of {} row(s) still match the plan exactly.",
+                                report.rows.len()
+                            )
+                            .into(),
+                        );
+                        if let Ok(mut handoff) = state_for_thread.handoff.lock() {
+                            *handoff = Some(LoadedHandoff {
+                                file,
+                                report,
+                                path: path_for_thread,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut handoff) = state_for_thread.handoff.lock() {
+                            *handoff = None;
+                        }
+                        ui.set_can_apply_handoff(false);
+                        ui.set_handoff_detail(
+                            format!("Could not open the plan file: {error}").into(),
+                        );
+                        ui.set_status("The plan file was not opened.".into());
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_apply_handoff({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let loaded = state.handoff.lock().ok().and_then(|guard| guard.clone());
+            let Some((applicable, path)) = (|| {
+                let handoff = loaded?;
+                let plan = handoff.report.applicable_plan(&handoff.file).ok()??;
+                Some((plan, handoff.path))
+            })() else {
+                ui.set_status(
+                    "Nothing in this plan can be applied safely. Reopen the plan to review the drift, or refresh the preview in this app."
+                        .into(),
+                );
+                ui.set_can_apply_handoff(false);
+                return;
+            };
+            if !applicable.is_executable() {
+                ui.set_status(
+                    "The rows that still match would collide or fail validation, so nothing was applied."
+                        .into(),
+                );
+                ui.set_can_apply_handoff(false);
+                return;
+            }
+            ui.set_can_apply_handoff(false);
+            ui.set_applying(true);
+            ui.set_status(
+                format!(
+                    "Applying {} row(s) from {} that still match the plan. Changed, missing, or occupied rows are left alone.",
+                    applicable.actions.len(),
+                    path.display()
+                )
+                .into(),
+            );
+            let cancellation = CancellationToken::default();
+            if let Ok(mut current) = state.cancellation.lock() {
+                *current = Some(cancellation.clone());
+            }
+            let state_for_finish = Arc::clone(&state);
+            thread::spawn(move || {
+                let result = (|| {
+                    let journal = Journal::open(operation_ledger_path())?;
+                    let mut executor = Executor::new(journal);
+                    executor.execute(&applicable, &cancellation, |event| update_progress(&weak, event))
+                })();
+                if let Ok(mut handoff) = state_for_finish.handoff.lock() {
+                    *handoff = None;
+                }
+                if let Ok(mut guard) = state_for_finish.plan.lock() {
+                    *guard = None;
+                }
+                if let Ok(mut guard) = state_for_finish.excluded.lock() {
+                    guard.clear();
+                }
+                if let Ok(mut guard) = state_for_finish.cancellation.lock() {
+                    *guard = None;
+                }
+                refresh_ledger(weak.clone(), Arc::clone(&state_for_finish));
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_applying(false);
+                    ui.set_can_apply(false);
+                    ui.set_can_apply_handoff(false);
+                    ui.set_handoff_rows(ModelRc::new(Rc::new(VecModel::default())));
+                    match result {
+                        Ok(outcome) => {
+                            ui.set_handoff_detail(
+                                format!(
+                                    "Applied {} row(s) from the plan; {} failed. Job {} is recorded in the recovery ledger.",
+                                    outcome.applied, outcome.failed, outcome.job_id
+                                )
+                                .into(),
+                            );
+                            ui.set_status(
+                                format!(
+                                    "Plan handoff applied: {} change(s) completed{}. The plan is consumed; reopen it to review the folder again.",
+                                    outcome.applied,
+                                    if outcome.cancelled { " before stopping" } else { "" }
+                                )
+                                .into(),
+                            );
+                        }
+                        Err(error) => {
+                            ui.set_handoff_detail(
+                                format!("No changes were started: {error}").into(),
+                            );
+                            ui.set_status(format!("Plan handoff failed: {error}").into());
+                        }
+                    }
+                });
+            });
+        }
+    });
 
     // Preset listing at startup is a small, bounded folder read, like the
     // initial history load above; it runs before the event loop so the combo
@@ -1599,6 +1820,134 @@ fn operation_ledger_path() -> PathBuf {
     state_directory().join("operations.sqlite")
 }
 
+/// Writes `contents` through a temporary file plus a rename, the same commit
+/// discipline the preset store uses: a reader never sees a partial plan file.
+fn write_atomically(target: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let temp = target.with_extension(format!("{}.partial", std::process::id()));
+    std::fs::write(&temp, contents.as_bytes())
+        .map_err(|error| format!("{}: {error}", temp.display()))?;
+    if let Err(error) = std::fs::rename(&temp, target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("{}: {error}", target.display()));
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Where "Save plan" writes when the user has not typed a path: a
+/// timestamped file in the app's own `plans` folder, named after the scanned
+/// folder so it is recognisable later.
+fn handoff_path_for(typed: &str, plan: &PlannedJob) -> PathBuf {
+    if !typed.is_empty() {
+        return PathBuf::from(typed);
+    }
+    let folder = plan
+        .request
+        .inputs
+        .first()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "plan".to_owned());
+    let safe: String = folder
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    state_directory()
+        .join("plans")
+        .join(format!("{safe}-{}.json", now_unix_ms()))
+}
+
+/// Row-by-row drift for the handoff table. `new_files` are reported in the
+/// summary line instead, because they have no stored row to compare against.
+fn handoff_rows(report: &DriftReport) -> Vec<HandoffRow> {
+    report
+        .rows
+        .iter()
+        .map(|row| HandoffRow {
+            name: row
+                .source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| row.source.display().to_string())
+                .into(),
+            state: drift_state_label(row.state).into(),
+            detail: row.detail.clone().into(),
+        })
+        .collect()
+}
+
+fn drift_state_label(state: DriftState) -> &'static str {
+    match state {
+        DriftState::Unchanged => "Matches plan",
+        DriftState::SourceChanged => "File changed",
+        DriftState::SourceMissing => "File missing",
+        DriftState::ResultDiffers => "Rules now differ",
+        DriftState::TargetNowExists => "Target taken",
+    }
+}
+
+/// Plain-language drift summary. Every count is text, never colour-only, and
+/// the line states exactly what Apply would touch.
+fn handoff_detail_text(file: &PlanFile, report: &DriftReport) -> String {
+    let total = report.rows.len();
+    let unchanged = report.count(DriftState::Unchanged);
+    let mut text = format!(
+        "Plan made {} · {} rule(s) · {total} file row(s): {unchanged} still match, {} changed since the plan, {} missing, {} now propose a different name, {} whose target is now taken.",
+        format_unix_ms(file.created_unix_ms),
+        file.pipeline.rules.len(),
+        report.count(DriftState::SourceChanged),
+        report.count(DriftState::SourceMissing),
+        report.count(DriftState::ResultDiffers),
+        report.count(DriftState::TargetNowExists)
+    );
+    if report.new_files.is_empty() {
+        text.push_str(" The folder has no files the plan does not mention.");
+    } else {
+        let first = report
+            .new_files
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            " {} file(s) exist that the plan never mentions (for example {first}); they are never changed.",
+            report.new_files.len()
+        ));
+    }
+    if unchanged > 0 {
+        text.push_str(&format!(
+            " Apply would rename exactly those {unchanged} unchanged row(s); everything else is left alone."
+        ));
+    } else {
+        text.push_str(" Nothing can be applied safely from this plan as it stands.");
+    }
+    text
+}
+
 fn preset_store() -> PresetStore {
     PresetStore::new(state_directory().join("presets"))
 }
@@ -1799,6 +2148,95 @@ mod tests {
         assert_eq!(counter_value("photo_0007.jpg", 4), Some(7));
         assert_eq!(counter_value("photo_07.jpg", 4), None);
         assert_eq!(counter_value("photo_07.jpg", 2), Some(7));
+    }
+
+    #[test]
+    fn a_written_plan_round_trips_and_reports_its_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x-".into() }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        let target = dir.path().join("handoff.json");
+        let file = PlanFile::from_plan(&planned, &pipeline, 1_700_000_000_000);
+        write_atomically(&target, &file.to_json().unwrap()).unwrap();
+
+        let text = fs::read_to_string(&target).unwrap();
+        let parsed = PlanFile::from_json(&text).unwrap();
+        let report = parsed.evaluate().unwrap();
+        assert_eq!(report.count(DriftState::Unchanged), 2);
+        assert!(handoff_detail_text(&parsed, &report).contains("2 still match"));
+
+        let rows = handoff_rows(&report);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].state, "Matches plan");
+
+        // A file the plan never mentioned must not look applicable.
+        fs::write(dir.path().join("c.txt"), "c").unwrap();
+        let report = parsed.evaluate().unwrap();
+        assert_eq!(report.new_files.len(), 1);
+        let detail = handoff_detail_text(&parsed, &report);
+        assert!(detail.contains("never mentions"), "{detail}");
+    }
+
+    #[test]
+    fn drift_detail_states_when_nothing_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x-".into() }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        let file = PlanFile::from_plan(&planned, &pipeline, 0);
+        fs::write(dir.path().join("a.txt"), "changed content").unwrap();
+        let report = file.evaluate().unwrap();
+        assert_eq!(report.count(DriftState::SourceChanged), 1);
+        assert_eq!(handoff_rows(&report)[0].state, "File changed");
+        assert!(handoff_detail_text(&file, &report).contains("Nothing can be applied safely"));
+    }
+
+    #[test]
+    fn atomic_write_leaves_the_target_and_no_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("plan.json");
+        write_atomically(&target, "{\"format\":\"x\"}").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"format\":\"x\"}");
+        let leftovers: Vec<String> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_typed_plan_path_wins_over_the_default_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &RulePipeline::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_path_for("D:/reviews/plan.json", &planned),
+            PathBuf::from("D:/reviews/plan.json")
+        );
+        let default = handoff_path_for("  ", &planned);
+        assert!(default.starts_with(state_directory().join("plans")));
+        assert_eq!(
+            default.extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
     }
 
     #[test]

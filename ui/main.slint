@@ -18,10 +18,16 @@ export struct LedgerRow {
     detail: string,
 }
 
+export struct HandoffRow {
+    name: string,
+    state: string,
+    detail: string,
+}
+
 component MainWindow inherits Window {
     title: "FilenameWeaver";
     width: 1280px;
-    height: 1000px;
+    height: 1160px;
 
     in-out property <string> folder_path: "";
     in-out property <bool> recursive: false;
@@ -63,6 +69,13 @@ component MainWindow inherits Window {
     in-out property <string> preset_detail: "No saved presets yet.";
     in-out property <bool> confirming_preset_delete: false;
 
+    // Plan handoff: one portable file records the plan; opening it revalidates
+    // every row against the folder as it exists now.
+    in-out property <string> plan_path: "";
+    in-out property <string> handoff_detail: "Save plan writes this reviewed plan to a portable JSON file. Opening a plan re-checks every row against the folder before anything is applied.";
+    in-out property <[HandoffRow]> handoff_rows: [];
+    in-out property <bool> can_apply_handoff: false;
+
     in-out property <[LedgerRow]> ledger_rows: [];
     in-out property <int> selected_job_index: -1;
     in-out property <string> ledger_detail: "Select Refresh history to load recorded jobs.";
@@ -83,6 +96,9 @@ component MainWindow inherits Window {
     callback save_preset();
     callback load_preset();
     callback delete_preset();
+    callback save_plan();
+    callback open_plan();
+    callback apply_handoff();
     callback refresh_ledger();
     callback select_job(int);
     callback rollback_selected();
@@ -531,6 +547,65 @@ component MainWindow inherits Window {
                         wrap: word-wrap;
                         color: #334155;
                         accessible-label: "Status";
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #ffffff;
+            border-color: #cbd5e1;
+            border-width: 1px;
+            border-radius: 8px;
+            height: 200px;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                Text { text: "Plan handoff"; font-size: 18px; font-weight: 700; color: #172033; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.plan_path;
+                        placeholder-text: "Plan file path — leave blank to save into the app's plans folder";
+                        accessible-label: "Plan file path";
+                        accessible-description: "Where Save plan writes the plan, or which plan file Open plan reviews. A plan file contains paths and rules, never file contents.";
+                    }
+                    Button {
+                        text: "Save plan";
+                        clicked => { root.save_plan(); }
+                        accessible-description: "Write the reviewed plan to a portable file that someone else can revalidate and apply.";
+                    }
+                    Button {
+                        text: "Open plan";
+                        clicked => { root.open_plan(); }
+                        accessible-description: "Open a plan file and re-check every row against the folder as it exists now. Nothing is changed until you apply the safe subset.";
+                    }
+                    Button {
+                        text: "Apply unchanged rows";
+                        enabled: root.can_apply_handoff && !root.applying;
+                        clicked => { root.apply_handoff(); }
+                        accessible-description: "Apply only the rows that still match the plan. Changed, missing, or occupied rows are skipped and left alone.";
+                    }
+                }
+                Text {
+                    text: root.handoff_detail;
+                    wrap: word-wrap;
+                    color: #334155;
+                    accessible-label: "Plan review";
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        for row[idx] in root.handoff_rows : Rectangle {
+                            height: 28px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text { text: row.name; width: 200px; font-weight: 600; overflow: elide; color: #172033; }
+                                Text { text: row.state; width: 150px; overflow: elide; color: #334155; }
+                                Text { text: row.detail; horizontal-stretch: 1; overflow: elide; color: #4a5568; }
+                            }
+                        }
                     }
                 }
             }
