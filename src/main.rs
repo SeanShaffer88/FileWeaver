@@ -9,9 +9,10 @@ use std::thread;
 use fileweaver_core::{
     CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, ExecuteError,
     ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError, OperationKind,
-    PlanRequest, PlannedJob, RollbackReport, Rule, RulePipeline, SortOrder, plan,
+    PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary, RollbackReport, Rule,
+    RulePipeline, SortOrder, plan,
 };
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
 
@@ -22,6 +23,8 @@ struct AppState {
     /// truth for the next preview; the UI only edits it.
     rules: Mutex<Vec<Rule>>,
     selected_rule: Mutex<Option<usize>>,
+    /// Presets as last listed from disk, in the order the combo box shows.
+    presets: Mutex<Vec<PresetSummary>>,
     cancellation: Mutex<Option<CancellationToken>>,
     ledger_job_ids: Mutex<Vec<i64>>,
     selected_job_id: Mutex<Option<i64>>,
@@ -256,6 +259,141 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    ui.on_save_preset({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let name = ui.get_preset_name().trim().to_owned();
+            if name.is_empty() {
+                ui.set_status("Enter a preset name before saving.".into());
+                return;
+            }
+            let pipeline = current_pipeline(&state);
+            let store = preset_store();
+            let state_for_thread = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
+            thread::spawn(move || {
+                let result = store
+                    .save(&name, &pipeline)
+                    .and_then(|summary| Ok((summary, store.list()?)));
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
+                    Ok((summary, listing)) => {
+                        apply_preset_listing(&ui, &state_for_thread, &listing);
+                        ui.set_status(
+                            format!(
+                                "Saved preset \u{201c}{}\u{201d} ({} rule(s)). The edited rule stack is unchanged.",
+                                summary.name, summary.rule_count
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_status(format!("Could not save the preset: {error}").into());
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_load_preset({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(summary) = selected_preset(&state, &ui) else {
+                ui.set_status("Select a saved preset first.".into());
+                return;
+            };
+            ui.set_confirming_preset_delete(false);
+            let store = preset_store();
+            let state_for_thread = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
+            thread::spawn(move || {
+                let result = store.load(&summary.file_name);
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
+                    Ok(file) => {
+                        let name = file.name.clone();
+                        let count = file.pipeline.rules.len();
+                        if let Ok(mut rules) = state_for_thread.rules.lock() {
+                            *rules = file.pipeline.rules;
+                        }
+                        if let Ok(mut selected) = state_for_thread.selected_rule.lock() {
+                            *selected = (count > 0).then_some(0);
+                        }
+                        refresh_rule_ui(&ui, &state_for_thread);
+                        clear_preview(&state_for_thread, &ui);
+                        ui.set_status(
+                            format!(
+                                "Loaded preset \u{201c}{name}\u{201d} ({count} rule(s)). Select Refresh preview to review the updated plan before applying."
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_status(
+                            format!("Could not load preset \u{201c}{}\u{201d}: {error}", summary.name)
+                                .into(),
+                        );
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_delete_preset({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(summary) = selected_preset(&state, &ui) else {
+                ui.set_status("Select a saved preset first.".into());
+                return;
+            };
+            if !ui.get_confirming_preset_delete() {
+                ui.set_confirming_preset_delete(true);
+                ui.set_status(
+                    format!(
+                        "Confirm deleting the preset \u{201c}{}\u{201d}. This removes the saved rule stack only; the current rule stack is unchanged. Select Delete again to continue.",
+                        summary.name
+                    )
+                    .into(),
+                );
+                return;
+            }
+            ui.set_confirming_preset_delete(false);
+            let store = preset_store();
+            let state_for_thread = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
+            thread::spawn(move || {
+                let result = store.delete(&summary.file_name).and_then(|()| store.list());
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
+                    Ok(listing) => {
+                        apply_preset_listing(&ui, &state_for_thread, &listing);
+                        ui.set_status(
+                            format!("Deleted the preset \u{201c}{}\u{201d}.", summary.name).into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_status(
+                            format!(
+                                "Could not delete the preset \u{201c}{}\u{201d}: {error}",
+                                summary.name
+                            )
+                            .into(),
+                        );
+                    }
+                });
+            });
+        }
+    });
+
     // Initial history load is synchronous: it is a small bounded read, and
     // the event loop is not running yet to receive a posted update.
     match Journal::open(operation_ledger_path()).and_then(|journal| journal.list_jobs(20)) {
@@ -267,6 +405,16 @@ fn main() -> Result<(), slint::PlatformError> {
         }
         Err(error) => {
             ui.set_ledger_detail(format!("Could not read the operation ledger: {error}").into());
+        }
+    }
+
+    // Preset listing at startup is a small, bounded folder read, like the
+    // initial history load above; it runs before the event loop so the combo
+    // box is populated on first paint.
+    match preset_store().list() {
+        Ok(listing) => apply_preset_listing(&ui, &state, &listing),
+        Err(error) => {
+            ui.set_preset_detail(format!("Could not read saved presets: {error}").into());
         }
     }
 
@@ -1303,13 +1451,76 @@ fn order_summary_text(plan: &PlannedJob, pipeline: &RulePipeline) -> String {
     text
 }
 
-fn operation_ledger_path() -> PathBuf {
+/// Local application-state folder. Resolution order (documented in the
+/// README): `LOCALAPPDATA`, then `XDG_STATE_HOME`, then `~/.local/state`, then
+/// the working directory.
+fn state_directory() -> PathBuf {
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| env::var_os("XDG_STATE_HOME").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("FileWeaver").join("operations.sqlite")
+    base.join("FileWeaver")
+}
+
+fn operation_ledger_path() -> PathBuf {
+    state_directory().join("operations.sqlite")
+}
+
+fn preset_store() -> PresetStore {
+    PresetStore::new(state_directory().join("presets"))
+}
+
+/// The preset the combo box currently points at, if any.
+fn selected_preset(state: &AppState, ui: &MainWindow) -> Option<PresetSummary> {
+    let index = usize::try_from(ui.get_preset_index()).ok()?;
+    state.presets.lock().ok()?.get(index).cloned()
+}
+
+/// Publishes a listing to both the shell model and the state the handlers
+/// resolve preset indices against. The selection is cleared because the list
+/// contents (and therefore the indices) may have changed.
+fn apply_preset_listing(ui: &MainWindow, state: &AppState, listing: &PresetListing) {
+    if let Ok(mut presets) = state.presets.lock() {
+        *presets = listing.presets.clone();
+    }
+    let names: Vec<SharedString> = listing
+        .presets
+        .iter()
+        .map(|preset| SharedString::from(preset.name.as_str()))
+        .collect();
+    ui.set_preset_names(ModelRc::new(Rc::new(VecModel::from(names))));
+    ui.set_preset_index(-1);
+    ui.set_confirming_preset_delete(false);
+    ui.set_preset_detail(preset_detail_text(listing).into());
+}
+
+fn preset_detail_text(listing: &PresetListing) -> String {
+    let warnings = listing
+        .warnings
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if listing.presets.is_empty() {
+        if warnings.is_empty() {
+            "No saved presets yet. Name the current rule stack below and select Save preset to reuse it later."
+                .to_owned()
+        } else {
+            format!("No usable presets were found. {warnings}")
+        }
+    } else {
+        let base = format!(
+            "{} saved preset(s). Loading a preset replaces the current rule stack; nothing is applied to files.",
+            listing.presets.len()
+        );
+        if warnings.is_empty() {
+            base
+        } else {
+            format!("{base} {warnings}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1456,6 +1667,24 @@ mod tests {
         assert_eq!(counter_value("photo_0007.jpg", 4), Some(7));
         assert_eq!(counter_value("photo_07.jpg", 4), None);
         assert_eq!(counter_value("photo_07.jpg", 2), Some(7));
+    }
+
+    #[test]
+    fn preset_detail_text_reports_counts_and_warnings() {
+        let listing = PresetListing {
+            presets: vec![PresetSummary {
+                name: "Photo cleanup".into(),
+                file_name: "photo-cleanup.json".into(),
+                rule_count: 2,
+            }],
+            warnings: vec!["Skipped broken.json: not a preset".into()],
+        };
+        let text = preset_detail_text(&listing);
+        assert!(text.contains("1 saved preset(s)"), "{text}");
+        assert!(text.contains("Skipped broken.json"), "{text}");
+
+        let empty = preset_detail_text(&PresetListing::default());
+        assert!(empty.contains("No saved presets yet"), "{empty}");
     }
 
     #[test]

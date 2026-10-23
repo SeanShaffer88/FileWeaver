@@ -54,6 +54,14 @@ component MainWindow inherits Window {
     in-out property <int> editor_counter_width: 4;
     in-out property <string> editor_hint: "";
 
+    // Named rule-stack presets, stored as versioned JSON files beside the
+    // operation ledger. The combo box indexes the loaded list.
+    in-out property <[string]> preset_names: [];
+    in-out property <int> preset_index: -1;
+    in-out property <string> preset_name: "";
+    in-out property <string> preset_detail: "No saved presets yet.";
+    in-out property <bool> confirming_preset_delete: false;
+
     in-out property <[LedgerRow]> ledger_rows: [];
     in-out property <int> selected_job_index: -1;
     in-out property <string> ledger_detail: "Select Refresh history to load recorded jobs.";
@@ -71,6 +79,9 @@ component MainWindow inherits Window {
     callback move_rule_down();
     callback select_rule(int);
     callback editor_changed();
+    callback save_preset();
+    callback load_preset();
+    callback delete_preset();
     callback refresh_ledger();
     callback select_job(int);
     callback rollback_selected();
@@ -235,6 +246,52 @@ component MainWindow inherits Window {
                         text: "Refresh preview";
                         clicked => { root.refresh_preview(); }
                         accessible-description: "Recalculate the proposed names without changing files.";
+                    }
+                    Rectangle { height: 1px; background: #dbe3ee; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        ComboBox {
+                            horizontal-stretch: 1;
+                            model: root.preset_names;
+                            current-index <=> root.preset_index;
+                            selected => { root.confirming_preset_delete = false; }
+                            accessible-label: "Saved presets";
+                            accessible-description: "Rule-stack presets saved on this computer. Select a preset, then Load to replace the rule stack or Delete to remove the saved preset.";
+                        }
+                        Button {
+                            text: "Load";
+                            enabled: root.preset_index >= 0;
+                            clicked => { root.load_preset(); }
+                            accessible-description: "Replace the current rule stack with the selected preset. Nothing is applied to files.";
+                        }
+                        Button {
+                            text: root.confirming_preset_delete ? "Confirm" : "Delete";
+                            enabled: root.preset_index >= 0;
+                            clicked => { root.delete_preset(); }
+                            accessible-label: "Delete preset";
+                            accessible-description: "Remove the selected saved preset after a confirmation. The current rule stack is unchanged.";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text <=> root.preset_name;
+                            placeholder-text: "Preset name";
+                            accessible-label: "Preset name";
+                            accessible-description: "Name for the current rule stack when you save it as a preset.";
+                        }
+                        Button {
+                            text: "Save preset";
+                            clicked => { root.save_preset(); }
+                            accessible-description: "Save the current ordered rule stack under this name as a reusable preset.";
+                        }
+                    }
+                    Text {
+                        text: root.preset_detail;
+                        wrap: word-wrap;
+                        color: #4a5568;
+                        accessible-label: "Preset status";
                     }
                 }
             }
