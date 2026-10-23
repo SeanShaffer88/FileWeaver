@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use fileweaver_core::{
+use filenameweaver_core::{
     CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, ExecuteError,
     ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError, OperationKind,
     PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary, RollbackReport, Rule,
@@ -1120,14 +1120,14 @@ fn rows_for_plan(plan: &PlannedJob, excluded: &BTreeSet<String>) -> Vec<PreviewR
         .collect()
 }
 
-fn row_state(action: &fileweaver_core::PlannedAction, included: bool) -> String {
+fn row_state(action: &filenameweaver_core::PlannedAction, included: bool) -> String {
     if !included {
         return "Excluded — will not change".into();
     }
     if let Some(issue) = action
         .issues
         .iter()
-        .find(|issue| issue.severity == fileweaver_core::Severity::Error)
+        .find(|issue| issue.severity == filenameweaver_core::Severity::Error)
     {
         format!("Blocked: {}", issue.message)
     } else if !action.will_change() {
@@ -1135,7 +1135,7 @@ fn row_state(action: &fileweaver_core::PlannedAction, included: bool) -> String 
     } else if let Some(issue) = action
         .issues
         .iter()
-        .find(|issue| issue.severity == fileweaver_core::Severity::Warning)
+        .find(|issue| issue.severity == filenameweaver_core::Severity::Warning)
     {
         format!("Review: {}", issue.message)
     } else {
@@ -1167,11 +1167,11 @@ fn summary_text(plan: &PlannedJob) -> String {
 }
 
 fn risk_budget_text(plan: &PlannedJob, excluded: usize) -> String {
-    let has_error = |action: &fileweaver_core::PlannedAction| {
+    let has_error = |action: &filenameweaver_core::PlannedAction| {
         action
             .issues
             .iter()
-            .any(|issue| issue.severity == fileweaver_core::Severity::Error)
+            .any(|issue| issue.severity == filenameweaver_core::Severity::Error)
     };
     let blocked = plan.actions.iter().filter(|a| has_error(a)).count();
     let review = plan
@@ -1182,11 +1182,11 @@ fn risk_budget_text(plan: &PlannedJob, excluded: usize) -> String {
                 && !has_error(a)
                 && a.issues
                     .iter()
-                    .any(|issue| issue.severity == fileweaver_core::Severity::Warning)
+                    .any(|issue| issue.severity == filenameweaver_core::Severity::Warning)
         })
         .count();
     let mut text = format!(
-        "Risk budget: {} to change · {} blocked · {} to review · {} unchanged · 0 overwrites — FileWeaver never overwrites.",
+        "Risk budget: {} to change · {} blocked · {} to review · {} unchanged · 0 overwrites — FilenameWeaver never overwrites.",
         plan.summary.ready, blocked, review, plan.summary.unchanged
     );
     if plan.summary.cross_volume_candidates > 0 {
@@ -1262,7 +1262,7 @@ fn refresh_preview_view(ui: &MainWindow, state: &AppState) {
 /// Rule-stage provenance for one preview row: the original name followed by
 /// the result of each rule stage, in pipeline order. The stages were recorded
 /// by the rule engine when the plan was built — this only formats them.
-fn provenance_text(action: &fileweaver_core::PlannedAction) -> String {
+fn provenance_text(action: &filenameweaver_core::PlannedAction) -> String {
     if action.stages.is_empty() {
         return format!(
             "{} — no rules in the pipeline, so the name is unchanged.",
@@ -1592,7 +1592,7 @@ fn state_directory() -> PathBuf {
         .or_else(|| env::var_os("XDG_STATE_HOME").map(PathBuf::from))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("FileWeaver")
+    base.join("FilenameWeaver")
 }
 
 fn operation_ledger_path() -> PathBuf {

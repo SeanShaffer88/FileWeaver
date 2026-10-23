@@ -1,19 +1,19 @@
 [package]
-name = "fileweaver"
+name = "filenameweaver"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-description = "A local-first Windows file organization and batch-renaming studio"
+description = "A local-first Windows batch-renaming utility with reviewable plans and recovery"
 license = "MIT"
-repository = "https://github.com/SeanShaffer88/FileWeaver"
+repository = "https://github.com/SeanShaffer88/FilenameWeaver"
 build = "build.rs"
 
 [lib]
-name = "fileweaver_core"
+name = "filenameweaver_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fileweaver"
+name = "filenameweaver"
 path = "src/main.rs"
 
 [dependencies]

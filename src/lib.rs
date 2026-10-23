@@ -1,4 +1,4 @@
-//! Core services for FileWeaver.
+//! Core services for FilenameWeaver.
 //!
 //! The crate deliberately separates planning from filesystem mutation. A plan
 //! can be inspected and tested without changing a file. Execution accepts

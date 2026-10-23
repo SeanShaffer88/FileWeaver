@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::rules::RulePipeline;
 
-pub const PRESET_FORMAT: &str = "fileweaver-preset";
+pub const PRESET_FORMAT: &str = "filenameweaver-preset";
 pub const PRESET_FORMAT_VERSION: u32 = 1;
 
 /// Longest slug written to disk, in bytes. The preset's display name is stored
@@ -29,9 +29,9 @@ pub enum PresetError {
     EmptyName,
     #[error("the preset name has no characters that can be used in a file name")]
     UnusableName,
-    #[error("this file is not a FileWeaver preset (format tag found: {0:?})")]
+    #[error("this file is not a FilenameWeaver preset (format tag found: {0:?})")]
     WrongFormat(String),
-    #[error("preset format version {0} is not supported by this version of FileWeaver")]
+    #[error("preset format version {0} is not supported by this version of FilenameWeaver")]
     UnsupportedVersion(u32),
     #[error("preset files must be addressed by file name only: {0}")]
     InvalidFileName(String),
@@ -68,7 +68,7 @@ impl PresetFile {
     }
 
     /// Parses a preset file, refusing anything that is not a supported
-    /// FileWeaver preset with a specific reason.
+    /// FilenameWeaver preset with a specific reason.
     pub fn from_json(text: &str) -> Result<Self, PresetError> {
         let file: PresetFile = serde_json::from_str(text)?;
         if file.format != PRESET_FORMAT {

@@ -341,7 +341,7 @@ fn preflight_rollback(items: Vec<AppliedItem>) -> (Vec<AppliedItem>, RollbackRep
             Ok(_) => report.skipped.push(RollbackBlockedItem {
                 index: item.index,
                 destination: item.destination,
-                reason: "The file changed after this job, so FileWeaver will not overwrite it."
+                reason: "The file changed after this job, so FilenameWeaver will not overwrite it."
                     .into(),
             }),
             Err(error) => report.skipped.push(RollbackBlockedItem {
@@ -528,7 +528,7 @@ fn unique_temp_path(path: &Path, job_id: i64, index: usize) -> Result<PathBuf, E
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     for attempt in 0..1_000_u32 {
         let candidate = parent.join(format!(
-            ".{name}.fileweaver-{job_id}-{index}-{attempt}.partial"
+            ".{name}.filenameweaver-{job_id}-{index}-{attempt}.partial"
         ));
         if !candidate.exists() {
             return Ok(candidate);

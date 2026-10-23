@@ -1,8 +1,8 @@
-# FileWeaver (early implementation)
+# FilenameWeaver (early implementation)
 
-> A local-first Windows batch-renaming and file-organization studio designed to make every proposed file change visible, explainable, and recoverable.
+> A local-first Windows batch-renaming utility designed to make every proposed filename visible, explainable, and recoverable. It renames files; it is not a file manager.
 
-**Status: version 0.1.0 — foundation / review build, not production-ready.** The core planner, safe rename executor, local SQLite operation ledger, and an accessible Slint desktop shell are implemented. The full professional workflow described in [`docs/fileweaver-market-and-architecture.md`](docs/fileweaver-market-and-architecture.md) is **not** complete yet.
+**Status: version 0.1.0 — foundation / review build, not production-ready.** The core planner, safe rename executor, local SQLite operation ledger, and an accessible Slint desktop shell are implemented. The full professional workflow described in [`docs/filenameweaver-market-and-architecture.md`](docs/filenameweaver-market-and-architecture.md) is **not** complete yet.
 
 ## What this build does
 
@@ -83,17 +83,18 @@ Cross-volume moves cannot be atomic. They are implemented as copy → byte-count
 
 ## Local data and privacy
 
-- **Windows location:** `%LOCALAPPDATA%\FileWeaver\operations.sqlite`
-- **Other development platforms:** `$XDG_STATE_HOME/FileWeaver/operations.sqlite`, then `~/.local/state/FileWeaver/operations.sqlite`
-- The path is resolved from the first of those variables that is set (on Windows, if `LOCALAPPDATA` is unset the same fallback chain applies). If none is set, the ledger is created relative to the process working directory as `./FileWeaver/operations.sqlite`.
-- **Presets:** `<same FileWeaver folder>\presets\*.json` (or `presets/*.json` on other development platforms), one file per saved rule stack. Each file records a format tag, a format version, the app version, the preset name, and the rule pipeline. The build refuses a preset whose version it does not understand instead of guessing.
+- **Windows location:** `%LOCALAPPDATA%\FilenameWeaver\operations.sqlite`
+- **Other development platforms:** `$XDG_STATE_HOME/FilenameWeaver/operations.sqlite`, then `~/.local/state/FilenameWeaver/operations.sqlite`
+- The path is resolved from the first of those variables that is set (on Windows, if `LOCALAPPDATA` is unset the same fallback chain applies). If none is set, the ledger is created relative to the process working directory as `./FilenameWeaver/operations.sqlite`.
+- **Presets:** `<same FilenameWeaver folder>\presets\*.json` (or `presets/*.json` on other development platforms), one file per saved rule stack. Each file records a format tag, a format version, the app version, the preset name, and the rule pipeline. The build refuses a preset whose version it does not understand instead of guessing.
+- Builds before the rename stored this data under the earlier product name. This pre-release build does not read or migrate that older folder; if you ran one of those builds, delete the old folder manually.
 - The current build has no networking, telemetry, update checking, account, synchronization, upload, or online metadata lookup.
 - The operation ledger contains file paths and outcome metadata. Treat it as sensitive. The ledger uses SQLite's WAL mode, so `operations.sqlite-wal` and `operations.sqlite-shm` may sit alongside it while the app runs; close the app before copying it as a backup so all state is folded back into the main file. Deleting it removes rollback history.
 
 ## Project layout
 
 ```text
-src/lib.rs        Core crate root (fileweaver_core) and its public API re-exports
+src/lib.rs        Core crate root (filenameweaver_core) and its public API re-exports
 src/domain.rs     Data model, issue taxonomy, plan/request records
 src/rules.rs      Deterministic pure naming-rule pipeline
 src/metadata.rs   Narrow JPEG/Exif reader that tolerates malformed files
@@ -113,7 +114,7 @@ ui/main.slint     Accessible desktop shell
 | **Apply is disabled** | The preview has blocking issues, no changes, or no folder was scanned. Read each row’s status; the initial UI needs better issue filtering. |
 | **A path is not scanned** | Check spelling, access permissions, and whether it is a symbolic link. The current build deliberately skips symlinks/reparse-point-like links. |
 | **“Target appeared after preview”** | Another program changed the folder after planning. Refresh the preview; the executor refuses to overwrite it. |
-| **A saved preset is missing from the list** | The file was unreadable or not a FileWeaver preset; the preset panel names the first skipped files. Presets live in the `presets` folder next to the operation ledger. |
+| **A saved preset is missing from the list** | The file was unreadable or not a FilenameWeaver preset; the preset panel names the first skipped files. Presets live in the `presets` folder next to the operation ledger. |
 | **A preset save fails** | Check that the state folder is writable; the status line reports the file error. Saving never modifies your files. |
 | **Recovery skips a file** | The destination’s size/modification fingerprint differs from the recorded post-operation result, or its original location is occupied. The Recovery ledger’s review shows which files are unchanged, changed, or missing before you roll back; preserve both files and resolve skipped ones manually. |
 | **Behaviour on Linux/macOS** | Not a supported platform. The core and shell compile there and the core tests pass, which is useful during development, but the Windows filename rules and the Windows UX are neither meaningful nor validated off Windows. |
@@ -124,4 +125,4 @@ This repository is licensed under the **MIT License**. See [`LICENSE`](LICENSE).
 
 ## Research and design record
 
-See [`docs/fileweaver-market-and-architecture.md`](docs/fileweaver-market-and-architecture.md) for source-backed competitor research, a separate feature inventory, feature-by-feature decisions, original feature hypotheses, framework comparison, privacy/installer plan, and verification plan.
+See [`docs/filenameweaver-market-and-architecture.md`](docs/filenameweaver-market-and-architecture.md) for source-backed competitor research, a separate feature inventory, feature-by-feature decisions, original feature hypotheses, framework comparison, privacy/installer plan, and verification plan.

@@ -1,6 +1,6 @@
-# FileWeaver — innovation review (2026-10-20)
+# FilenameWeaver — innovation review (2026-10-20)
 
-Companion to [`fileweaver-market-and-architecture.md`](fileweaver-market-and-architecture.md), whose §6 lists the original feature concepts. This review re-scores those concepts against the **implemented 0.1.0 code** (not the plan), adds new candidates that the current architecture makes unusually cheap or natural, and ranks everything by user value, distinctiveness, feasibility, and fit with the program's quality aims: dependable, frictionless, predictable, forgiving, transparent, offline, privacy-conscious, accessible, and out of the way.
+Companion to [`filenameweaver-market-and-architecture.md`](filenameweaver-market-and-architecture.md), whose §6 lists the original feature concepts. This review re-scores those concepts against the **implemented 0.1.0 code** (not the plan), adds new candidates that the current architecture makes unusually cheap or natural, and ranks everything by user value, distinctiveness, feasibility, and fit with the program's quality aims: dependable, frictionless, predictable, forgiving, transparent, offline, privacy-conscious, accessible, and out of the way.
 
 **Honesty rules used here.** Distinctiveness is a *hypothesis*, not a claim — §3 of the architecture doc establishes what comparable products verifiably do, and nothing below asserts uniqueness beyond that evidence. "Status" statements were checked against the source on 2026-10-20.
 
@@ -62,7 +62,7 @@ Scores: ● strong, ◐ moderate, ○ weak. Ranking weighs user value first, the
 
 ### 4. Reviewable Plan Handoff
 
-- **Experience.** "Save plan…" exports one file containing the folder reference, the rule pipeline, the full old→new list, and the plan's risk summary. A colleague (or the same user, later, or on another machine) opens it in FileWeaver: the plan is **re-validated against the folder as it exists now**, drift is reported row-by-row ("3 source files changed since this plan was made; 1 target now exists"), and only then can it be applied — by someone who never built the rules.
+- **Experience.** "Save plan…" exports one file containing the folder reference, the rule pipeline, the full old→new list, and the plan's risk summary. A colleague (or the same user, later, or on another machine) opens it in FilenameWeaver: the plan is **re-validated against the folder as it exists now**, drift is reported row-by-row ("3 source files changed since this plan was made; 1 target now exists"), and only then can it be applied — by someone who never built the rules.
 - **Problem.** In archive and team workflows the person who *approves* a naming change is often not the person who *proposes* it, and today the review artifact is a screenshot or nothing. It also gives individuals an auditable "what exactly will happen" record before a big job.
 - **Distinctive hypothesis.** Presets and CSV mappings exist elsewhere; a self-describing, re-validating plan artifact that separates propose → review → apply builds directly on this product's serializable plan + journal design.
 - **Quality traits.** Transparent, predictable, interoperable, forgiving (drift is caught before, not during, execution).
@@ -79,7 +79,7 @@ Scores: ● strong, ◐ moderate, ○ weak. Ranking weighs user value first, the
 
 ### 6. Collection sequence memory
 
-- **Experience.** For a folder (or named collection), FileWeaver remembers the last counter value a job used there. Next ingest, the preview says "This collection's sequence reached 0142 on Oct 18 — continue at 0143?" with a one-click override. Stored in the local ledger; always shown, never silent.
+- **Experience.** For a folder (or named collection), FilenameWeaver remembers the last counter value a job used there. Next ingest, the preview says "This collection's sequence reached 0142 on Oct 18 — continue at 0143?" with a one-click override. Stored in the local ledger; always shown, never silent.
 - **Problem.** Photographers ingest in batches over weeks. Restarting at 1 collides or forces manual bookkeeping in a notebook; continuing by hand is error-prone.
 - **Distinctive hypothesis.** Named counters exist in at least one competitor (§3 notes licensed named counters), but tying continuation to the *collection's own durable job history* — with the evidence shown in the preview — follows from this product's ledger rather than a global counter list.
 - **Feasibility / risk / maintenance.** Medium: a small ledger query + UI state. The whole risk is hidden state, so the rule is: the source of the start value is always displayed ("starting at 143 because…") and editable.

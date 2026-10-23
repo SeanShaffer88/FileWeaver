@@ -1182,7 +1182,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fileweaver"
+name = "filenameweaver"
 version = "0.1.0"
 dependencies = [
  "kamadak-exif",

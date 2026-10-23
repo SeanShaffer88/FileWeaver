@@ -461,7 +461,7 @@ fn apply_collision_validation(actions: &mut [PlannedAction], policy: CollisionPo
             action.issues.push(PlanIssue::error(
                 PlanIssueKind::ExistingTarget,
                 format!(
-                    "{} already exists and FileWeaver will not overwrite it.",
+                    "{} already exists and FilenameWeaver will not overwrite it.",
                     action.destination.display()
                 ),
             ));
