@@ -1,6 +1,7 @@
 import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, SpinBox, VerticalBox } from "std-widgets.slint";
 
 export struct PreviewRow {
+    plan_index: int,
     old_name: string,
     proposed_name: string,
     state: string,
@@ -40,6 +41,10 @@ component MainWindow inherits Window {
     in-out property <[PreviewRow]> rows: [];
     in-out property <int> selected_row_index: -1;
     in-out property <string> provenance: "";
+    // Preview filter and list export. Filtering is a view concern only.
+    in-out property <int> filter_index: 0;
+    in-out property <string> filter_summary: "";
+    in-out property <string> export_path: "";
 
     // Ordered rule stack. The list is authored in the shell and converted to
     // the core rule pipeline; the preview always reflects this exact order.
@@ -103,6 +108,8 @@ component MainWindow inherits Window {
     callback select_job(int);
     callback rollback_selected();
     callback select_row(int);
+    callback filter_changed(int);
+    callback export_rows();
     callback toggle_row(int);
 
     background: #f7f8fa;
@@ -495,7 +502,25 @@ component MainWindow inherits Window {
                 VerticalLayout {
                     padding: 14px;
                     spacing: 8px;
-                    Text { text: "Preview"; font-size: 18px; font-weight: 700; color: #172033; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Preview"; font-size: 18px; font-weight: 700; color: #172033; horizontal-stretch: 1; }
+                        Text { text: "Show"; color: #334155; vertical-alignment: center; }
+                        ComboBox {
+                            width: 210px;
+                            model: ["Everything", "Will change", "Blocked", "Needs review"];
+                            current-index <=> root.filter_index;
+                            selected => { root.filter_changed(root.filter_index); }
+                            accessible-label: "Preview filter";
+                            accessible-description: "Show every row, only rows that will change, only blocked rows, or only rows with warnings. Filtering never changes the plan or what Apply does.";
+                        }
+                        Button {
+                            text: "Export list";
+                            enabled: root.rows.length > 0 || root.export_path != "";
+                            clicked => { root.export_rows(); }
+                            accessible-description: "Write the reviewed names to a CSV file for review or record keeping. Names only; no file contents.";
+                        }
+                    }
                     Text {
                         text: root.risk_budget;
                         wrap: word-wrap;
@@ -547,6 +572,12 @@ component MainWindow inherits Window {
                         wrap: word-wrap;
                         color: #334155;
                         accessible-label: "Status";
+                    }
+                    LineEdit {
+                        text <=> root.export_path;
+                        placeholder-text: "CSV export path — leave blank to write into the app's exports folder";
+                        accessible-label: "CSV export path";
+                        accessible-description: "Where Export list writes the reviewed rows as CSV.";
                     }
                 }
             }

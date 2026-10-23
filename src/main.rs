@@ -10,12 +10,57 @@ use std::thread;
 use filenameweaver_core::{
     CancellationToken, CaseStyle, CollisionPolicy, DateSource, Divergence, DriftReport, DriftState,
     ExecuteError, ExecuteProgress, Executor, JobReview, JobSummary, Journal, JournalError,
-    OperationKind, PlanFile, PlanRequest, PlannedJob, PresetListing, PresetStore, PresetSummary,
-    RollbackReport, Rule, RulePipeline, SortOrder, plan, subset_plan,
+    OperationKind, PlanFile, PlanRequest, PlannedAction, PlannedJob, PresetListing, PresetStore,
+    PresetSummary, RollbackReport, Rule, RulePipeline, Severity, SortOrder, plan, subset_plan,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
+
+/// Preview table filter. `Changes` and `Warnings` describe what would happen
+/// to a row, independent of whether the user has excluded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewFilter {
+    All,
+    Changes,
+    Blocked,
+    Warnings,
+}
+
+impl PreviewFilter {
+    fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Changes,
+            2 => Self::Blocked,
+            3 => Self::Warnings,
+            _ => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "everything",
+            Self::Changes => "files that will change",
+            Self::Blocked => "blocked files",
+            Self::Warnings => "files needing review",
+        }
+    }
+
+    /// Whether `action` belongs in the table under this filter.
+    fn keeps(self, action: &PlannedAction) -> bool {
+        let blocked = action.is_blocked();
+        let warned = action
+            .issues
+            .iter()
+            .any(|issue| issue.severity == Severity::Warning);
+        match self {
+            Self::All => true,
+            Self::Changes => !blocked && action.will_change(),
+            Self::Blocked => blocked,
+            Self::Warnings => !blocked && warned,
+        }
+    }
+}
 
 /// A plan file the user opened, together with the drift report produced by
 /// revalidating it against the folder as it exists now.
@@ -39,6 +84,13 @@ struct AppState {
     selected_rule: Mutex<Option<usize>>,
     /// Presets as last listed from disk, in the order the combo box shows.
     presets: Mutex<Vec<PresetSummary>>,
+    /// Which rows the preview table shows. Filtering never changes the plan;
+    /// it only changes what is visible and therefore what a row click means.
+    filter: Mutex<PreviewFilter>,
+    /// Visible row index -> index in `plan.actions`, rebuilt on every render.
+    /// Row callbacks must translate through this, because filtering would
+    /// otherwise make a click act on the wrong file.
+    visible: Mutex<Vec<usize>>,
     cancellation: Mutex<Option<CancellationToken>>,
     /// A reviewed plan handoff and its drift report, kept so the safe subset
     /// can be applied without re-reading the file.
@@ -93,17 +145,20 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = Arc::clone(&state);
         let weak = ui.as_weak();
         move |index| {
-            let Ok(index) = usize::try_from(index) else {
+            let Ok(visible_index) = usize::try_from(index) else {
+                return;
+            };
+            let Some(plan_index) = plan_index_for(&state, visible_index) else {
                 return;
             };
             let text = state.plan.lock().ok().and_then(|guard| {
                 guard
                     .as_ref()
-                    .and_then(|plan| plan.actions.get(index))
+                    .and_then(|plan| plan.actions.get(plan_index))
                     .map(provenance_text)
             });
             if let (Some(ui), Some(text)) = (weak.upgrade(), text) {
-                ui.set_selected_row_index(index as i32);
+                ui.set_selected_row_index(i32::try_from(visible_index).unwrap_or(-1));
                 ui.set_provenance(text.into());
             }
         }
@@ -254,16 +309,19 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = Arc::clone(&state);
         let weak = ui.as_weak();
         move |index| {
-            let Ok(index) = usize::try_from(index) else {
+            let Ok(visible_index) = usize::try_from(index) else {
                 return;
             };
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            let Some(plan_index) = plan_index_for(&state, visible_index) else {
+                return;
+            };
             let key = state.plan.lock().ok().and_then(|guard| {
                 guard
                     .as_ref()
-                    .and_then(|plan| plan.actions.get(index))
+                    .and_then(|plan| plan.actions.get(plan_index))
                     .map(|action| plan_key(&action.snapshot.source))
             });
             let Some(key) = key else {
@@ -452,6 +510,83 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_ledger_detail(format!("Could not read the operation ledger: {error}").into());
         }
     }
+
+    ui.on_filter_changed({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            let filter = PreviewFilter::from_index(index);
+            if let Ok(mut current) = state.filter.lock() {
+                *current = filter;
+            }
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(plan) = state.plan.lock().ok().and_then(|guard| guard.clone()) else {
+                return;
+            };
+            let excluded = excluded_set(&state);
+            publish_rows(&ui, &state, &plan, &excluded);
+            let shown = state
+                .visible
+                .lock()
+                .map(|visible| visible.len())
+                .unwrap_or_default();
+            ui.set_status(
+                format!(
+                    "Showing {} of {} row(s): {}. Filtering only changes what you see; it never changes the plan or what Apply does.",
+                    shown,
+                    plan.actions.len(),
+                    filter.label()
+                )
+                .into(),
+            );
+        }
+    });
+
+    ui.on_export_rows({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(plan) = state.plan.lock().ok().and_then(|guard| guard.clone()) else {
+                ui.set_status("Build a preview before exporting the list.".into());
+                return;
+            };
+            let excluded = excluded_set(&state);
+            let target = export_path_for(ui.get_export_path().trim(), &plan);
+            let csv = csv_for_plan(&plan, &excluded);
+            ui.set_status("Exporting the reviewed list…".into());
+            let weak_for_thread = weak.clone();
+            thread::spawn(move || {
+                let result = write_atomically(&target, &csv);
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| match result {
+                    Ok(()) => {
+                        let rows = plan.actions.len();
+                        let excluded_count = excluded.len();
+                        ui.set_export_path(target.to_string_lossy().to_string().into());
+                        ui.set_status(
+                            format!(
+                                "Exported {rows} row(s) to {}{}. The file lists names only — no file contents — and is safe to share for review.",
+                                target.display(),
+                                if excluded_count > 0 {
+                                    format!(", marking {excluded_count} as excluded")
+                                } else {
+                                    String::new()
+                                }
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_status(format!("Could not export the list: {error}").into());
+                    }
+                });
+            });
+        }
+    });
 
     ui.on_save_plan({
         let state = Arc::clone(&state);
@@ -820,13 +955,16 @@ fn schedule_preview(
     let summary_pipeline = pipeline.clone();
     thread::spawn(move || match plan(request, &pipeline) {
         Ok(new_plan) => {
-            let rows = rows_for_plan(&new_plan, &BTreeSet::new());
+            let (rows, visible) = render_rows(&new_plan, &BTreeSet::new(), PreviewFilter::All);
             let summary = summary_text(&new_plan);
             let risk_budget = risk_budget_text(&new_plan, 0);
             let order_summary = order_summary_text(&new_plan, &summary_pipeline);
             let executable = new_plan.is_executable();
             let plan_for_check = new_plan.clone();
             let state_for_check = Arc::clone(&state);
+            if let Ok(mut mapping) = state.visible.lock() {
+                *mapping = visible;
+            }
             if let Ok(mut current) = state.plan.lock() {
                 *current = Some(new_plan);
             }
@@ -1344,22 +1482,57 @@ fn apply_editor_to_rule(ui: &MainWindow, rule: &mut Rule) {
     }
 }
 
-fn rows_for_plan(plan: &PlannedJob, excluded: &BTreeSet<String>) -> Vec<PreviewRow> {
-    plan.actions
-        .iter()
-        .map(|action| {
-            let included = !excluded.contains(&plan_key(&action.snapshot.source));
-            PreviewRow {
-                old_name: action.snapshot.original_name.clone().into(),
-                proposed_name: action.proposed_name.clone().into(),
-                state: row_state(action, included).into(),
-                included,
-            }
-        })
-        .collect()
+/// Builds the visible preview rows and the mapping back to plan indices.
+/// Filtering happens here, once, so the table and the click handlers can never
+/// disagree about which file a row means.
+fn render_rows(
+    plan: &PlannedJob,
+    excluded: &BTreeSet<String>,
+    filter: PreviewFilter,
+) -> (Vec<PreviewRow>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut visible = Vec::new();
+    for (index, action) in plan.actions.iter().enumerate() {
+        if !filter.keeps(action) {
+            continue;
+        }
+        let included = !excluded.contains(&plan_key(&action.snapshot.source));
+        rows.push(PreviewRow {
+            plan_index: i32::try_from(index).unwrap_or(-1),
+            old_name: action.snapshot.original_name.clone().into(),
+            proposed_name: action.proposed_name.clone().into(),
+            state: row_state(action, included).into(),
+            included,
+        });
+        visible.push(index);
+    }
+    (rows, visible)
 }
 
-fn row_state(action: &filenameweaver_core::PlannedAction, included: bool) -> String {
+/// Resolves a visible table row to its index in the stored plan.
+fn plan_index_for(state: &AppState, visible_index: usize) -> Option<usize> {
+    state
+        .visible
+        .lock()
+        .ok()
+        .and_then(|visible| visible.get(visible_index).copied())
+}
+
+/// Publishes rendered rows plus the index mapping, and clears the row
+/// selection because the selected visible position no longer means the same
+/// file after a filter or inclusion change.
+fn publish_rows(ui: &MainWindow, state: &AppState, plan: &PlannedJob, excluded: &BTreeSet<String>) {
+    let filter = current_filter(state);
+    let (rows, visible) = render_rows(plan, excluded, filter);
+    if let Ok(mut mapping) = state.visible.lock() {
+        *mapping = visible;
+    }
+    ui.set_rows(ModelRc::new(Rc::new(VecModel::from(rows))));
+    ui.set_selected_row_index(-1);
+    ui.set_provenance("".into());
+}
+
+fn row_state(action: &PlannedAction, included: bool) -> String {
     if !included {
         return "Excluded — will not change".into();
     }
@@ -1488,14 +1661,53 @@ fn refresh_preview_view(ui: &MainWindow, state: &AppState) {
     };
     let excluded = excluded_set(state);
     let applicable = applicable_plan_of(&plan, &excluded);
-    let rows = rows_for_plan(&plan, &excluded);
-    ui.set_rows(ModelRc::new(Rc::new(VecModel::from(rows))));
-    ui.set_selected_row_index(-1);
-    ui.set_provenance("".into());
+    publish_rows(ui, state, &plan, &excluded);
     ui.set_risk_budget(risk_budget_text(&applicable, excluded.len()).into());
     ui.set_order_summary(order_summary_text(&applicable, &current_pipeline(state)).into());
     ui.set_can_apply(applicable.is_executable());
     ui.set_status(preview_status_text(&plan, &applicable, excluded.len()).into());
+}
+
+fn current_filter(state: &AppState) -> PreviewFilter {
+    state
+        .filter
+        .lock()
+        .map(|filter| *filter)
+        .unwrap_or(PreviewFilter::All)
+}
+
+/// CSV export of the reviewed rows, in the same order and with the same
+/// inclusion flags the preview shows. Columns are quoted per RFC 4180 so a
+/// filename containing a comma, quote, or newline cannot corrupt the file.
+fn csv_for_plan(plan: &PlannedJob, excluded: &BTreeSet<String>) -> String {
+    let mut text = String::from("included,current_name,proposed_name,status,issues\n");
+    for action in &plan.actions {
+        let included = !excluded.contains(&plan_key(&action.snapshot.source));
+        let issues = action
+            .issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        text.push_str(&format!(
+            "{},{},{},{},{}\n",
+            if included { "yes" } else { "no" },
+            csv_field(&action.snapshot.original_name),
+            csv_field(&action.proposed_name),
+            csv_field(&row_state(action, included)),
+            csv_field(&issues),
+        ));
+    }
+    text
+}
+
+/// Quotes a CSV field only when it needs quoting, doubling any inner quotes.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 /// Rule-stage provenance for one preview row: the original name followed by
@@ -1895,6 +2107,36 @@ fn handoff_path_for(typed: &str, plan: &PlannedJob) -> PathBuf {
         .join(format!("{safe}-{}.json", now_unix_ms()))
 }
 
+/// Where "Export list" writes when the user has not typed a path: a
+/// timestamped CSV in the app's own `exports` folder.
+fn export_path_for(typed: &str, plan: &PlannedJob) -> PathBuf {
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return PathBuf::from(typed);
+    }
+    let folder = plan
+        .request
+        .inputs
+        .first()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "plan".to_owned());
+    let safe: String = folder
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    state_directory()
+        .join("exports")
+        .join(format!("{safe}-{}.csv", now_unix_ms()))
+}
+
 /// Row-by-row drift for the handoff table. `new_files` are reported in the
 /// summary line instead, because they have no stored row to compare against.
 fn handoff_rows(report: &DriftReport) -> Vec<HandoffRow> {
@@ -2170,6 +2412,94 @@ mod tests {
     }
 
     #[test]
+    fn filters_select_rows_without_reordering_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "CON.txt"] {
+            fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x-".into() }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        let excluded = BTreeSet::new();
+
+        let (rows, visible) = render_rows(&planned, &excluded, PreviewFilter::All);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(visible, vec![0, 1, 2]);
+        // The plan index is carried into the row so a click can never act on
+        // the wrong file after filtering.
+        assert_eq!(rows[1].plan_index, 1);
+
+        let (rows, visible) = render_rows(&planned, &excluded, PreviewFilter::Blocked);
+        assert_eq!(rows.len(), 1, "only the reserved-name target is blocked");
+        assert_eq!(visible, vec![rows[0].plan_index as usize]);
+        assert_eq!(rows[0].old_name, "CON.txt");
+
+        let (changes, _) = render_rows(&planned, &excluded, PreviewFilter::Changes);
+        assert_eq!(changes.len(), 2);
+        assert!(!changes.iter().any(|row| row.state.starts_with("Blocked")));
+    }
+
+    #[test]
+    fn csv_export_quotes_awkward_names_and_marks_inclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let pipeline = RulePipeline {
+            rules: vec![Rule::AddPrefix { text: "x,y".into() }],
+        };
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &pipeline,
+        )
+        .unwrap();
+        let mut excluded = BTreeSet::new();
+        excluded.insert(plan_key(&planned.actions[0].snapshot.source));
+
+        let csv = csv_for_plan(&planned, &excluded);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "included,current_name,proposed_name,status,issues"
+        );
+        let row = lines.next().unwrap();
+        assert!(row.starts_with("no,"), "{row}");
+        assert!(row.contains("\"x,ya.txt\""), "{row}");
+    }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        assert_eq!(csv_field("plain.txt"), "plain.txt");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert!(csv_field("line\nbreak").starts_with('"'));
+        assert!(csv_field("line\r\nbreak").starts_with('"'));
+    }
+
+    #[test]
+    fn a_typed_export_path_wins_over_the_default_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &RulePipeline::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            export_path_for(" D:/review/list.csv ", &planned),
+            PathBuf::from("D:/review/list.csv")
+        );
+        let default = export_path_for("   ", &planned);
+        assert!(default.starts_with(state_directory().join("exports")));
+        assert_eq!(
+            default.extension().and_then(|value| value.to_str()),
+            Some("csv")
+        );
+    }
+
+    #[test]
     fn a_written_plan_round_trips_and_reports_its_drift() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "a").unwrap();
@@ -2284,7 +2614,7 @@ mod tests {
         assert_eq!(applicable.actions[0].snapshot.original_name, "b.txt");
         assert!(applicable.is_executable());
 
-        let rows = rows_for_plan(&planned, &excluded);
+        let (rows, _) = render_rows(&planned, &excluded, PreviewFilter::All);
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].included);
         assert!(rows[0].state.contains("Excluded"));
