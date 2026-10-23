@@ -27,6 +27,12 @@ enum PreviewFilter {
     Warnings,
 }
 
+impl Default for PreviewFilter {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
 impl PreviewFilter {
     fn from_index(index: i32) -> Self {
         match index {
