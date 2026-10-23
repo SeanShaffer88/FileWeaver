@@ -9,6 +9,7 @@ pub mod domain;
 pub mod executor;
 pub mod handoff;
 pub mod journal;
+pub mod mapping;
 pub mod metadata;
 pub mod planner;
 pub mod presets;

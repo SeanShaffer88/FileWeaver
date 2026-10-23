@@ -12,6 +12,9 @@
 - Saves the ordered rule stack as a named **preset** and loads it again later or on another machine. Presets are versioned JSON files that contain only rules — never file paths — so loading one cannot point the app at a folder you did not choose. Saving writes through a temporary file plus a rename, so an interrupted save cannot leave a half-written preset, and a preset can be deleted from the shell behind a confirmation.
 - Filters the preview — everything, only rows that will change, only blocked rows, or only rows needing review — without changing the plan or what Apply does. Row clicks and include checkboxes are re-mapped after filtering, so a filtered table can never act on the wrong file.
 - **Exports the reviewed list** to CSV (included flag, current name, proposed name, status, issues) through the same atomic write used for plans. Fields are quoted per RFC 4180, so a comma or quote in a filename cannot corrupt the file. The export lists names only — never file contents.
+- **Imports an explicit name mapping** from CSV (`current_name,proposed_name` — the same format the export writes, so a list can be exported, edited in a spreadsheet, and imported back). Importing builds a preview through the same filename, collision, exclusion, Apply, ledger, and handoff safeguards as a rule-based preview. Files with no mapping row keep their name and are marked for review, mapping rows that match no file are reported, duplicate or incomplete rows are reported rather than guessed, and a name swap within one batch is allowed. Editing any rule, changing the folder, or re-scanning replaces the mapping preview.
+- Sorts the preview on screen — plan order, current or proposed name (A–Z or Z–A), or status — without changing the plan, counter numbering, or what Apply does.
+- Shows a **progress bar** during Apply, driven by the executor's per-file progress events, alongside the existing numeric status text.
 - Hands a plan to someone else (or to a later session) with the **plan handoff**: save the reviewed plan to a portable JSON file, open it again, and every stored row is re-checked against the folder as it exists now — *matches plan*, *file changed*, *file missing*, *rules now differ*, *target now taken* — with files the plan never mentioned counted separately and never touched. **Apply unchanged rows** executes only that fresh, fully validated subset; changed, missing, or occupied rows are skipped, and the plan is consumed afterwards. A plan file records paths, rules, and proposed names — never file contents.
 - Makes numbering order explicit (the **Order Observatory**): the shell offers Path, Name, Modified (oldest first), and Capture date (oldest first, from JPEG Exif) as the numbering/processing order, states the chosen order and the assigned counter range with every preview, and records the order in the plan and journal. Every order falls back to the stable path key on ties. The planner also warns about possible **sequence gaps** — holes in a numbered pattern (for example `IMG_0001, IMG_0002, IMG_0004`) in the proposed names; a gap is a warning, never a block, because it can be legitimate.
 - Validates empty names, invalid Windows filename characters, reserved DOS device names, trailing spaces/dots, the 255 UTF-16 code-unit filename-component limit, a conservative legacy path-length limit (destination paths over 259 UTF-16 code units are blocked), duplicate targets, and existing unselected targets.
@@ -28,9 +31,9 @@
 ## Intentionally not yet exposed or complete
 
 - Native file/folder picker and drag-and-drop intake (paste a path in the current shell). One folder is scanned per preview.
-- Sortable columns and thumbnails. (Rows can be filtered by state and included or excluded individually.)
+- Clickable column-header sorting and thumbnails. (Rows can be sorted from the Sort menu, filtered by state, and included or excluded individually.)
 - Copy/move destination templates. `OperationKind::Copy` and `OperationKind::Move` exist in the core API, but the shell always plans renames.
-- CSV/JSON **mapping import** (supplying a name per file) and a full job report. The reviewed list can already be exported to CSV; importing a mapping file and per-job reports have no implementation yet. Presets store a rule stack only; they do not record which folder or files a job targeted.
+- A full job report. The reviewed list can be exported to CSV and re-imported as a mapping; per-job reports have no implementation yet. Presets store a rule stack only; they do not record which folder or files a job targeted.
 - A native file dialog for plan files: Save plan / Open plan use a path typed into the shell, and saving with a blank path writes into the app's `plans` folder. Plan files are plain text JSON; the file picker and drag-and-drop intake are still missing.
 - Folder mutation, watched folders, Explorer context menu, portable-data mode, CLI automation, hash/duplicate analysis, metadata writing, document-content classification, integrations, and networking.
 - Stable Windows file IDs for rollback. This build uses a conservative size + modification-time fingerprint, so it may reject safe recovery and cannot prove identity against an adversarial or coincidental replacement.
@@ -63,7 +66,7 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (51 unit tests), and several validation paths are currently covered by code inspection only.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (65 unit tests), and several validation paths are currently covered by code inspection only.
 
 During development on a supported desktop platform:
 
@@ -106,6 +109,7 @@ src/metadata.rs   Narrow JPEG/Exif reader that tolerates malformed files
 src/planner.rs    Non-destructive scan, stable order, validation, collision detection
 src/journal.rs    SQLite operation ledger
 src/presets.rs    Versioned rule-preset format and atomic preset store
+src/mapping.rs    CSV mapping import (current_name,proposed_name) parsing
 src/executor.rs   Staged execution, cancellation, conservative rollback
 src/main.rs       Slint desktop integration and background work scheduling
 build.rs          Compiles ui/main.slint into the binary via slint-build
@@ -120,6 +124,7 @@ ui/main.slint     Accessible desktop shell
 | **A path is not scanned** | Check spelling, access permissions, and whether it is a symbolic link. The current build deliberately skips symlinks/reparse-point-like links. |
 | **“Target appeared after preview”** | Another program changed the folder after planning. Refresh the preview; the executor refuses to overwrite it. |
 | **A row is missing from the preview** | A preview filter is active. Set Show back to “Everything”; filtering never changes the plan. |
+| **A mapping import changed nothing / rows say “No mapping entry”** | Mapping names must match current file names exactly, including the extension. Rows that match no file are listed in the mapping details; files with no row keep their name by design. Duplicate or incomplete spreadsheet rows are reported and skipped — the first row for a name wins. |
 | **The CSV opens with everything in one column** | The file is comma-separated with RFC 4180 quoting. Import it as CSV, not as a plain text column. |
 | **“Nothing in this plan can be applied safely”** | Every stored row has drifted: files changed, moved, vanished, or the folder now yields different names. Refreshing the preview in this app is the fastest recovery; the plan file is only a record of what was proposed. |
 | **A plan file will not open** | The build refuses files whose format tag or version it does not recognise, and reports the reason in the Plan handoff panel. Only `filenameweaver-plan` version 1 files are accepted. |
