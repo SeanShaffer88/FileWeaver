@@ -1868,6 +1868,7 @@ fn now_unix_ms() -> i64 {
 /// timestamped file in the app's own `plans` folder, named after the scanned
 /// folder so it is recognisable later.
 fn handoff_path_for(typed: &str, plan: &PlannedJob) -> PathBuf {
+    let typed = typed.trim();
     if !typed.is_empty() {
         return PathBuf::from(typed);
     }
@@ -2181,7 +2182,10 @@ mod tests {
             &pipeline,
         )
         .unwrap();
-        let target = dir.path().join("handoff.json");
+        // The plan file must live outside the scanned folder, or it would show
+        // up as a file the plan never mentioned.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("handoff.json");
         let file = PlanFile::from_plan(&planned, &pipeline, 1_700_000_000_000);
         write_atomically(&target, &file.to_json().unwrap()).unwrap();
 
