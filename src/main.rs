@@ -469,7 +469,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_status("Saving the reviewed plan file…".into());
             thread::spawn(move || {
                 let file = PlanFile::from_plan(&plan, &pipeline, now_unix_ms());
-                let result = write_atomically(&target, &file.to_json().unwrap_or_default());
+                let result = file
+                    .to_json()
+                    .map_err(|error| error.to_string())
+                    .and_then(|text| write_atomically(&target, &text));
                 let _ = weak.upgrade_in_event_loop(move |ui| match result {
                     Ok(()) => {
                         ui.set_plan_path(target.to_string_lossy().to_string().into());
@@ -521,11 +524,12 @@ fn main() -> Result<(), slint::PlatformError> {
             let state_for_thread = Arc::clone(&state);
             let path_for_thread = path.clone();
             thread::spawn(move || {
-                let result = (|| {
-                    let text = std::fs::read_to_string(&path_for_thread)?;
-                    let file = PlanFile::from_json(&text)?;
-                    let report = file.evaluate()?;
-                    Ok::<_, String>((file, report))
+                let result: Result<(PlanFile, DriftReport), String> = (|| {
+                    let text = std::fs::read_to_string(&path_for_thread)
+                        .map_err(|error| error.to_string())?;
+                    let file = PlanFile::from_json(&text).map_err(|error| error.to_string())?;
+                    let report = file.evaluate().map_err(|error| error.to_string())?;
+                    Ok((file, report))
                 })();
                 let _ = weak.upgrade_in_event_loop(move |ui| match result {
                     Ok((file, report)) => {
@@ -572,19 +576,28 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let loaded = state.handoff.lock().ok().and_then(|guard| guard.clone());
-            let Some((applicable, path)) = (|| {
-                let handoff = loaded?;
-                let plan = handoff.report.applicable_plan(&handoff.file).ok()??;
-                Some((plan, handoff.path))
-            })() else {
-                ui.set_status(
-                    "Nothing in this plan can be applied safely. Reopen the plan to review the drift, or refresh the preview in this app."
-                        .into(),
-                );
+            let Some(handoff) = state.handoff.lock().ok().and_then(|guard| guard.clone()) else {
+                ui.set_status("Open a plan file before applying it.".into());
                 ui.set_can_apply_handoff(false);
                 return;
             };
+            let applicable = match handoff.report.applicable_plan(&handoff.file) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    ui.set_status(
+                        "Nothing in this plan can be applied safely. Reopen the plan to review the drift, or refresh the preview in this app."
+                            .into(),
+                    );
+                    ui.set_can_apply_handoff(false);
+                    return;
+                }
+                Err(error) => {
+                    ui.set_status(format!("The plan could not be revalidated: {error}").into());
+                    ui.set_can_apply_handoff(false);
+                    return;
+                }
+            };
+            let path = handoff.path.clone();
             if !applicable.is_executable() {
                 ui.set_status(
                     "The rows that still match would collide or fail validation, so nothing was applied."
