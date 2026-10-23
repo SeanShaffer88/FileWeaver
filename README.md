@@ -58,7 +58,7 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-There is currently no CI enforcing these commands — they are the contributor's local gate. The automated test suite is small (32 unit tests), and several validation paths are currently covered by code inspection only.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (32 unit tests), and several validation paths are currently covered by code inspection only.
 
 During development on a supported desktop platform:
 
