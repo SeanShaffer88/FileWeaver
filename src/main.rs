@@ -2415,24 +2415,25 @@ mod tests {
     #[test]
     fn filters_select_rows_without_reordering_them() {
         let dir = tempfile::tempdir().unwrap();
-        // The prefix rule collides with an existing file for `a.txt`, which is
-        // a realistic blocking error; the other two rows are ready to apply.
-        for name in ["a.txt", "b.txt", "x-a.txt"] {
-            fs::write(dir.path().join(name), "x").unwrap();
-        }
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        fs::write(dir.path().join("b.txt"), "x").unwrap();
+        // Not part of the selection: it occupies the name the prefix rule
+        // would give a.txt, which is a realistic blocking error.
+        fs::write(dir.path().join("x-a.txt"), "x").unwrap();
         let pipeline = RulePipeline {
             rules: vec![Rule::AddPrefix { text: "x-".into() }],
         };
         let planned = plan(
-            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            PlanRequest::rename(vec![dir.path().join("a.txt"), dir.path().join("b.txt")]),
             &pipeline,
         )
         .unwrap();
+        assert_eq!(planned.actions.len(), 2);
         let excluded = BTreeSet::new();
 
         let (rows, visible) = render_rows(&planned, &excluded, PreviewFilter::All);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(visible, vec![0, 1, 2]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(visible, vec![0, 1]);
         // The plan index is carried into the row so a click can never act on
         // the wrong file after filtering.
         assert_eq!(rows[1].plan_index, 1);
@@ -2443,7 +2444,8 @@ mod tests {
         assert_eq!(visible, vec![blocked[0].plan_index as usize]);
 
         let (changes, _) = render_rows(&planned, &excluded, PreviewFilter::Changes);
-        assert_eq!(changes.len(), 2);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].old_name, "b.txt");
         assert!(!changes.iter().any(|row| row.state.starts_with("Blocked")));
     }
 
