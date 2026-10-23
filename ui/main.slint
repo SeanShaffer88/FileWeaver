@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, SpinBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ProgressIndicator, ScrollView, SpinBox, VerticalBox } from "std-widgets.slint";
 
 export struct PreviewRow {
     plan_index: int,
@@ -44,6 +44,14 @@ component MainWindow inherits Window {
     // Preview filter and list export. Filtering is a view concern only.
     in-out property <int> filter_index: 0;
     in-out property <string> filter_summary: "";
+    // On-screen row order. View-only: plan order, counter numbering, and
+    // Apply behavior never change with it.
+    in-out property <int> preview_sort_index: 0;
+    // Job progress, 0.0–1.0, driven by executor progress events.
+    in-out property <float> progress_value: 0.0;
+    // Mapping import: explicit current_name,proposed_name CSV rows.
+    in-out property <string> mapping_path: "";
+    in-out property <string> mapping_detail: "Import a CSV with current_name,proposed_name rows to rename by explicit list instead of rules. Export list writes this format, so you can export, edit in a spreadsheet, and import back. Files with no row keep their name and are marked for review.";
     in-out property <string> export_path: "";
 
     // Ordered rule stack. The list is authored in the shell and converted to
@@ -109,6 +117,8 @@ component MainWindow inherits Window {
     callback rollback_selected();
     callback select_row(int);
     callback filter_changed(int);
+    callback preview_sort_changed(int);
+    callback import_mapping();
     callback export_rows();
     callback toggle_row(int);
 
@@ -514,6 +524,15 @@ component MainWindow inherits Window {
                             accessible-label: "Preview filter";
                             accessible-description: "Show every row, only rows that will change, only blocked rows, or only rows with warnings. Filtering never changes the plan or what Apply does.";
                         }
+                        Text { text: "Sort"; color: #334155; vertical-alignment: center; }
+                        ComboBox {
+                            width: 190px;
+                            model: ["Plan order", "Current A–Z", "Current Z–A", "Proposed A–Z", "Proposed Z–A", "Status"];
+                            current-index <=> root.preview_sort_index;
+                            selected => { root.preview_sort_changed(root.preview_sort_index); }
+                            accessible-label: "Preview sort order";
+                            accessible-description: "Order the preview rows on screen. Sorting never changes plan order, counter numbering, or what Apply does.";
+                        }
                         Button {
                             text: "Export list";
                             enabled: root.rows.length > 0 || root.export_path != "";
@@ -578,6 +597,28 @@ component MainWindow inherits Window {
                         placeholder-text: "CSV export path — leave blank to write into the app's exports folder";
                         accessible-label: "CSV export path";
                         accessible-description: "Where Export list writes the reviewed rows as CSV.";
+                    }
+                    Rectangle { height: 1px; background: #dbe3ee; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text <=> root.mapping_path;
+                            placeholder-text: "Mapping CSV path — current_name,proposed_name rows";
+                            accessible-label: "Mapping CSV path";
+                            accessible-description: "A CSV file of explicit renames. Importing builds a preview from the list instead of the rules; nothing changes until you apply that preview.";
+                        }
+                        Button {
+                            text: "Import mapping";
+                            clicked => { root.import_mapping(); }
+                            accessible-description: "Build a preview from the mapping CSV instead of the rules. Files with no row keep their name and are marked for review.";
+                        }
+                    }
+                    Text {
+                        text: root.mapping_detail;
+                        wrap: word-wrap;
+                        color: #334155;
+                        accessible-label: "Mapping import details";
                     }
                 }
             }
@@ -699,15 +740,23 @@ component MainWindow inherits Window {
             border-color: #cbd5e1;
             border-width: 1px;
             border-radius: 8px;
-            height: 68px;
+            height: 84px;
             HorizontalLayout {
                 padding: 12px;
                 spacing: 12px;
-                Text {
-                    text: "Files are never changed by Scan or Refresh preview. Apply is enabled only when the plan has no blocking errors.";
+                VerticalLayout {
                     horizontal-stretch: 1;
-                    wrap: word-wrap;
-                    color: #334155;
+                    spacing: 6px;
+                    Text {
+                        text: "Files are never changed by Scan or Refresh preview. Apply is enabled only when the plan has no blocking errors.";
+                        wrap: word-wrap;
+                        color: #334155;
+                    }
+                    ProgressIndicator {
+                        progress: root.progress_value;
+                        accessible-label: "Job progress";
+                        accessible-description: "Progress of the current apply job. The status text reports the same progress as numbers for screen readers.";
+                    }
                 }
                 Button {
                     text: "Stop";

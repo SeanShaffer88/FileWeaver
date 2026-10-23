@@ -63,6 +63,43 @@ impl PreviewFilter {
     }
 }
 
+/// On-screen ordering of preview rows. `PlanOrder` is the plan's own
+/// order — the order counters are assigned in and the journal records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PreviewSort {
+    #[default]
+    PlanOrder,
+    CurrentAsc,
+    CurrentDesc,
+    ProposedAsc,
+    ProposedDesc,
+    Status,
+}
+
+impl PreviewSort {
+    fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::CurrentAsc,
+            2 => Self::CurrentDesc,
+            3 => Self::ProposedAsc,
+            4 => Self::ProposedDesc,
+            5 => Self::Status,
+            _ => Self::PlanOrder,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlanOrder => "plan order",
+            Self::CurrentAsc => "current name (A–Z)",
+            Self::CurrentDesc => "current name (Z–A)",
+            Self::ProposedAsc => "proposed name (A–Z)",
+            Self::ProposedDesc => "proposed name (Z–A)",
+            Self::Status => "status",
+        }
+    }
+}
+
 /// A plan file the user opened, together with the drift report produced by
 /// revalidating it against the folder as it exists now.
 #[derive(Clone)]
@@ -92,6 +129,15 @@ struct AppState {
     /// Row callbacks must translate through this, because filtering would
     /// otherwise make a click act on the wrong file.
     visible: Mutex<Vec<usize>>,
+    /// How the preview table is ordered on screen. View-only, like the
+    /// filter: the plan's own order (which drives counters and journal
+    /// order) never changes.
+    preview_sort: Mutex<PreviewSort>,
+    /// Marker of the mapping file the current preview was built from, when
+    /// it came from a mapping import rather than from rules. Lets
+    /// `plan_is_current` verify a mapping plan against the imported entries
+    /// instead of against the rule pipeline.
+    mapping_marker: Mutex<Option<String>>,
     cancellation: Mutex<Option<CancellationToken>>,
     /// A reviewed plan handoff and its drift report, kept so the safe subset
     /// can be applied without re-reading the file.
@@ -545,6 +591,154 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    ui.on_preview_sort_changed({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move |index| {
+            let sort = PreviewSort::from_index(index);
+            if let Ok(mut current) = state.preview_sort.lock() {
+                *current = sort;
+            }
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(plan) = state.plan.lock().ok().and_then(|guard| guard.clone()) else {
+                return;
+            };
+            let excluded = excluded_set(&state);
+            publish_rows(&ui, &state, &plan, &excluded);
+            ui.set_status(
+                format!(
+                    "Preview sorted by {}. Sorting only changes what you see; plan order — and therefore counter numbering — is unchanged.",
+                    sort.label()
+                )
+                .into(),
+            );
+        }
+    });
+
+    ui.on_import_mapping({
+        let state = Arc::clone(&state);
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let mapping_path = ui.get_mapping_path().trim().to_string();
+            if mapping_path.is_empty() {
+                ui.set_mapping_detail(
+                    "Enter the path of a mapping CSV first. The format is current_name,proposed_name — the same file Export list writes, so you can export, edit in a spreadsheet, and import it back."
+                        .into(),
+                );
+                ui.set_status("No mapping file was imported.".into());
+                return;
+            }
+            let folder = ui.get_folder_path().trim().to_string();
+            if folder.is_empty() {
+                ui.set_mapping_detail(
+                    "Choose the folder the mapping applies to first: enter its path above, then import the mapping."
+                        .into(),
+                );
+                ui.set_status("No mapping file was imported.".into());
+                return;
+            }
+            let text = match std::fs::read_to_string(&mapping_path) {
+                Ok(text) => text,
+                Err(error) => {
+                    ui.set_mapping_detail(
+                        format!("Could not read {mapping_path}: {error}").into(),
+                    );
+                    ui.set_status("The mapping file was not imported.".into());
+                    return;
+                }
+            };
+            let import = match filenameweaver_core::parse_mapping_csv(&text) {
+                Ok(import) => import,
+                Err(error) => {
+                    ui.set_mapping_detail(format!("{mapping_path}: {error}. Nothing was imported; the spreadsheet needs at least one row with both a current name and a proposed name.").into());
+                    ui.set_status("The mapping file was not imported.".into());
+                    return;
+                }
+            };
+            let entries = import.entries.clone();
+            let marker = filenameweaver_core::mapping_pipeline_marker(&entries);
+            if let Ok(mut current) = state.mapping_marker.lock() {
+                *current = Some(marker);
+            }
+            if let Ok(mut excluded) = state.excluded.lock() {
+                excluded.clear();
+            }
+            let request = request_from_ui(&ui);
+            ui.set_can_apply(false);
+            ui.set_status(
+                "Building a non-destructive preview from the mapping…".into(),
+            );
+            let entry_count = entries.len();
+            let problems = import.problems.clone();
+            let state_for_thread = Arc::clone(&state);
+            let weak_for_thread = weak.clone();
+            thread::spawn(move || {
+                let result = filenameweaver_core::plan_from_mapping(request, &entries);
+                let _ = weak_for_thread.upgrade_in_event_loop(move |ui| {
+                    match result {
+                        Ok(new_plan) => {
+                            let summary = summary_text(&new_plan);
+                            let risk_budget = risk_budget_text(&new_plan, 0);
+                            let order_summary =
+                                order_summary_text(&new_plan, &RulePipeline::default());
+                            let executable = new_plan.is_executable();
+                            let plan_for_check = new_plan.clone();
+                            if let Ok(mut current) = state_for_thread.plan.lock() {
+                                *current = Some(new_plan.clone());
+                            }
+                            let excluded = excluded_set(&state_for_thread);
+                            publish_rows(&ui, &state_for_thread, &new_plan, &excluded);
+                            if plan_is_current(&plan_for_check, &ui, &state_for_thread) {
+                                ui.set_status(
+                                    format!("Mapping preview ready. {summary}").into(),
+                                );
+                                ui.set_risk_budget(risk_budget.into());
+                                ui.set_order_summary(order_summary.into());
+                                ui.set_can_apply(executable);
+                            } else {
+                                if let Ok(mut stored) = state_for_thread.plan.lock() {
+                                    *stored = None;
+                                }
+                                ui.set_status(
+                                    "Settings changed while the mapping preview was building. Import the mapping again to review it before applying."
+                                        .into(),
+                                );
+                            }
+                            let mut detail = format!(
+                                "Imported {entry_count} mapping row(s) from {mapping_path}. Names are matched exactly; files with no row keep their name and are marked for review. Editing any rule or re-scanning replaces this preview."
+                            );
+                            if !problems.is_empty() {
+                                detail.push_str(&format!(
+                                    " {} row(s) were skipped: {}",
+                                    problems.len(),
+                                    problems
+                                        .iter()
+                                        .take(5)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ));
+                            }
+                            ui.set_mapping_detail(detail.into());
+                        }
+                        Err(error) => {
+                            ui.set_mapping_detail(
+                                format!("The mapping could not be turned into a plan: {error}")
+                                    .into(),
+                            );
+                            ui.set_status("The mapping preview was not built.".into());
+                        }
+                    }
+                });
+            });
+        }
+    });
+
     ui.on_export_rows({
         let state = Arc::clone(&state);
         let weak = ui.as_weak();
@@ -746,6 +940,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             ui.set_can_apply_handoff(false);
             ui.set_applying(true);
+            ui.set_progress_value(0.0);
             ui.set_status(
                 format!(
                     "Applying {} row(s) from {} that still match the plan. Changed, missing, or occupied rows are left alone.",
@@ -783,6 +978,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 refresh_ledger(weak_for_thread.clone(), Arc::clone(&state_for_finish));
                 let _ = weak_for_thread.upgrade_in_event_loop(move |ui| {
                     ui.set_applying(false);
+                    ui.set_progress_value(0.0);
                     ui.set_can_apply(false);
                     ui.set_can_apply_handoff(false);
                     ui.set_handoff_rows(ModelRc::new(Rc::new(VecModel::default())));
@@ -879,6 +1075,18 @@ fn inputs_match(plan: &PlannedJob, request: &PlanRequest, pipeline: &RulePipelin
 }
 
 fn plan_is_current(plan: &PlannedJob, ui: &MainWindow, state: &AppState) -> bool {
+    // A mapping plan is current when the folder settings still match and
+    // the plan still carries the marker of the mapping that was imported;
+    // the rule pipeline is irrelevant to it (and vice versa).
+    if let Ok(marker) = state.mapping_marker.lock()
+        && let Some(marker) = marker.as_ref()
+    {
+        let request_json = serde_json::to_string(&plan.request).ok();
+        let current_json = serde_json::to_string(&request_from_ui(ui)).ok();
+        return request_json.is_some()
+            && request_json == current_json
+            && plan.pipeline_json == *marker;
+    }
     inputs_match(plan, &request_from_ui(ui), &current_pipeline(state))
 }
 
@@ -898,6 +1106,11 @@ fn selected_rule(state: &AppState) -> Option<usize> {
 /// Discards the stored preview after any input change, so a plan built from
 /// settings the user no longer sees can never be applied.
 fn clear_preview(state: &AppState, ui: &MainWindow) {
+    // Any settings change also ends a mapping import's authority: the next
+    // preview must be rebuilt from whatever the user now sees.
+    if let Ok(mut marker) = state.mapping_marker.lock() {
+        *marker = None;
+    }
     let had_plan = match state.plan.lock() {
         Ok(mut guard) => guard.take().is_some(),
         Err(_) => false,
@@ -937,6 +1150,10 @@ fn schedule_preview(
     if let Ok(mut excluded) = state.excluded.lock() {
         excluded.clear();
     }
+    // A rule-based preview replaces any mapping import.
+    if let Ok(mut marker) = state.mapping_marker.lock() {
+        *marker = None;
+    }
     ui.set_can_apply(false);
     ui.set_risk_budget("".into());
     ui.set_order_summary("".into());
@@ -956,7 +1173,12 @@ fn schedule_preview(
     let summary_pipeline = pipeline.clone();
     thread::spawn(move || match plan(request, &pipeline) {
         Ok(new_plan) => {
-            let (rows, visible) = render_rows(&new_plan, &BTreeSet::new(), PreviewFilter::All);
+            let (rows, visible) = render_rows(
+                &new_plan,
+                &BTreeSet::new(),
+                PreviewFilter::All,
+                PreviewSort::PlanOrder,
+            );
             let summary = summary_text(&new_plan);
             let risk_budget = risk_budget_text(&new_plan, 0);
             let order_summary = order_summary_text(&new_plan, &summary_pipeline);
@@ -1070,6 +1292,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     if let Some(ui) = weak.upgrade() {
         ui.set_can_apply(false);
         ui.set_applying(true);
+        ui.set_progress_value(0.0);
         ui.set_status(
             "Applying reviewed changes. The app records a local recovery ledger as it works…"
                 .into(),
@@ -1099,6 +1322,7 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         refresh_ledger(weak.clone(), Arc::clone(&state_for_finish));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_applying(false);
+                    ui.set_progress_value(0.0);
             ui.set_can_apply(false);
             ui.set_risk_budget("".into());
             ui.set_order_summary("".into());
@@ -1140,7 +1364,13 @@ fn schedule_apply(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
 
 fn update_progress(weak: &slint::Weak<MainWindow>, event: ExecuteProgress) {
     let weak = weak.clone();
+    let fraction = if event.total == 0 {
+        0.0
+    } else {
+        (event.completed as f32 / event.total as f32).clamp(0.0, 1.0)
+    };
     let _ = weak.upgrade_in_event_loop(move |ui| {
+        ui.set_progress_value(fraction);
         ui.set_status(
             format!(
                 "{}: {}/{} — {}",
@@ -1490,23 +1720,58 @@ fn render_rows(
     plan: &PlannedJob,
     excluded: &BTreeSet<String>,
     filter: PreviewFilter,
+    sort: PreviewSort,
 ) -> (Vec<PreviewRow>, Vec<usize>) {
-    let mut rows = Vec::new();
-    let mut visible = Vec::new();
+    let mut pairs: Vec<(PreviewRow, usize)> = Vec::new();
     for (index, action) in plan.actions.iter().enumerate() {
         if !filter.keeps(action) {
             continue;
         }
         let included = !excluded.contains(&plan_key(&action.snapshot.source));
-        rows.push(PreviewRow {
+        let row = PreviewRow {
             plan_index: i32::try_from(index).unwrap_or(-1),
             old_name: action.snapshot.original_name.clone().into(),
             proposed_name: action.proposed_name.clone().into(),
             state: row_state(action, included).into(),
             included,
-        });
-        visible.push(index);
+        };
+        pairs.push((row, index));
     }
+    // Sorting is a view concern only: ties always fall back to plan order,
+    // so the displayed order is deterministic and the plan itself — counter
+    // numbering, journal order — is never disturbed.
+    let name_key = |value: &slint::SharedString| value.to_lowercase();
+    match sort {
+        PreviewSort::PlanOrder => {}
+        PreviewSort::CurrentAsc => pairs.sort_by(|a, b| {
+            name_key(&a.0.old_name)
+                .cmp(&name_key(&b.0.old_name))
+                .then(a.1.cmp(&b.1))
+        }),
+        PreviewSort::CurrentDesc => pairs.sort_by(|a, b| {
+            name_key(&b.0.old_name)
+                .cmp(&name_key(&a.0.old_name))
+                .then(a.1.cmp(&b.1))
+        }),
+        PreviewSort::ProposedAsc => pairs.sort_by(|a, b| {
+            name_key(&a.0.proposed_name)
+                .cmp(&name_key(&b.0.proposed_name))
+                .then(a.1.cmp(&b.1))
+        }),
+        PreviewSort::ProposedDesc => pairs.sort_by(|a, b| {
+            name_key(&b.0.proposed_name)
+                .cmp(&name_key(&a.0.proposed_name))
+                .then(a.1.cmp(&b.1))
+        }),
+        PreviewSort::Status => pairs.sort_by(|a, b| {
+            a.0.state
+                .cmp(&b.0.state)
+                .then_with(|| name_key(&a.0.old_name).cmp(&name_key(&b.0.old_name)))
+                .then(a.1.cmp(&b.1))
+        }),
+    }
+    let visible: Vec<usize> = pairs.iter().map(|(_, index)| *index).collect();
+    let rows: Vec<PreviewRow> = pairs.into_iter().map(|(row, _)| row).collect();
     (rows, visible)
 }
 
@@ -1524,7 +1789,7 @@ fn plan_index_for(state: &AppState, visible_index: usize) -> Option<usize> {
 /// file after a filter or inclusion change.
 fn publish_rows(ui: &MainWindow, state: &AppState, plan: &PlannedJob, excluded: &BTreeSet<String>) {
     let filter = current_filter(state);
-    let (rows, visible) = render_rows(plan, excluded, filter);
+    let (rows, visible) = render_rows(plan, excluded, filter, current_sort(state));
     if let Ok(mut mapping) = state.visible.lock() {
         *mapping = visible;
     }
@@ -2293,6 +2558,47 @@ mod tests {
     }
 
     #[test]
+    fn sorting_reorders_rows_but_never_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.txt"), b"x").unwrap();
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        fs::write(dir.path().join("c.txt"), b"x").unwrap();
+        let planned = plan(
+            PlanRequest::rename(vec![dir.path().to_path_buf()]),
+            &RulePipeline {
+                rules: vec![Rule::AddPrefix { text: "z-".into() }],
+            },
+        )
+        .unwrap();
+        let excluded = BTreeSet::new();
+        // Plan order is scan order (paths A–Z).
+        let (rows, visible) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::All,
+            PreviewSort::PlanOrder,
+        );
+        assert_eq!(visible, vec![0, 1, 2]);
+        assert_eq!(rows[0].old_name.as_str(), "a.txt");
+        // Descending view: rows flip, plan indices follow their rows, and
+        // the stored plan order is untouched.
+        let (rows, visible) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::All,
+            PreviewSort::CurrentDesc,
+        );
+        assert_eq!(rows[0].old_name.as_str(), "c.txt");
+        assert_eq!(visible, vec![2, 1, 0]);
+        assert_eq!(planned.actions[0].snapshot.original_name, "a.txt");
+        // Combo indices are a UI contract with ui/main.slint.
+        assert_eq!(PreviewSort::from_index(0), PreviewSort::PlanOrder);
+        assert_eq!(PreviewSort::from_index(2), PreviewSort::CurrentDesc);
+        assert_eq!(PreviewSort::from_index(5), PreviewSort::Status);
+        assert_eq!(PreviewSort::from_index(99), PreviewSort::PlanOrder);
+    }
+
+    #[test]
     fn matching_inputs_are_current() {
         let dir = tempfile::tempdir().unwrap();
         let (request, pipeline, planned) = sample_plan(dir.path());
@@ -2367,7 +2673,7 @@ mod tests {
         let planned = plan(request, &RulePipeline::default()).unwrap();
         assert_eq!(
             provenance_text(&planned.actions[0]),
-            "photo.txt — no rules in the pipeline, so the name is unchanged."
+            "photo.txt — nothing transforms this name, so it is unchanged."
         );
     }
 
@@ -2431,19 +2737,34 @@ mod tests {
         assert_eq!(planned.actions.len(), 2);
         let excluded = BTreeSet::new();
 
-        let (rows, visible) = render_rows(&planned, &excluded, PreviewFilter::All);
+        let (rows, visible) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::All,
+            PreviewSort::PlanOrder,
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(visible, vec![0, 1]);
         // The plan index is carried into the row so a click can never act on
         // the wrong file after filtering.
         assert_eq!(rows[1].plan_index, 1);
 
-        let (blocked, visible) = render_rows(&planned, &excluded, PreviewFilter::Blocked);
+        let (blocked, visible) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::Blocked,
+            PreviewSort::PlanOrder,
+        );
         assert_eq!(blocked.len(), 1, "only the existing-target row is blocked");
         assert_eq!(blocked[0].old_name, "a.txt");
         assert_eq!(visible, vec![blocked[0].plan_index as usize]);
 
-        let (changes, _) = render_rows(&planned, &excluded, PreviewFilter::Changes);
+        let (changes, _) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::Changes,
+            PreviewSort::PlanOrder,
+        );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old_name, "b.txt");
         assert!(!changes.iter().any(|row| row.state.starts_with("Blocked")));
@@ -2619,7 +2940,12 @@ mod tests {
         assert_eq!(applicable.actions[0].snapshot.original_name, "b.txt");
         assert!(applicable.is_executable());
 
-        let (rows, _) = render_rows(&planned, &excluded, PreviewFilter::All);
+        let (rows, _) = render_rows(
+            &planned,
+            &excluded,
+            PreviewFilter::All,
+            PreviewSort::PlanOrder,
+        );
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].included);
         assert!(rows[0].state.contains("Excluded"));

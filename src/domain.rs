@@ -161,6 +161,7 @@ pub enum PlanIssueKind {
     MissingDestinationRoot,
     InvalidRule,
     MissingMetadata,
+    MappingProblem,
     NoChange,
     SequenceGap,
 }

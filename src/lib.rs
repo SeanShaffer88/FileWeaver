@@ -23,7 +23,10 @@ pub use executor::{
 };
 pub use handoff::{DriftReport, DriftState, HandoffAction, HandoffError, PlanFile, RowDrift};
 pub use journal::{JobSummary, Journal, JournalError, RollbackReport};
-pub use planner::{PlanError, plan, subset_plan};
+pub use mapping::{
+    MappingEntry, MappingError, MappingImport, mapping_pipeline_marker, parse_mapping_csv,
+};
+pub use planner::{PlanError, plan, plan_from_mapping, subset_plan};
 pub use presets::{
     PRESET_FORMAT, PRESET_FORMAT_VERSION, PresetError, PresetFile, PresetListing, PresetStore,
     PresetSummary,
