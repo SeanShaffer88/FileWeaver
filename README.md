@@ -8,6 +8,7 @@
 
 - Scans a folder without changing anything. By default only files directly in the selected folder are included; with **Include subfolders** enabled, the scan covers the entire folder tree at any depth.
 - Builds a preview from a **user-ordered rule stack**. The shell can add, select, reorder, edit, and remove these rules: add prefix, add suffix before the extension, literal replace (first or every match), regular-expression replace, change case, trim/collapse whitespace, change extension, date prefix (filesystem modified time or JPEG Exif capture date, with a configurable `time` format and separator), and append counter (configurable separator, first number, and digit width). Rules run top to bottom, and the rule list shows each rule’s current settings. The preview is **not** live: it updates only when you run Scan or Refresh preview, and Apply always executes the most recent preview — refresh after changing any rule before applying. A change-extension rule with a blank extension removes the extension. The desktop shell applies renames only — copy and move exist in the core API but are not exposed in the UI.
+- Includes or excludes **individual preview rows** before applying. The exclusion is resolved through the planner's own subset validation, so an excluded row cannot hide a collision or a filename problem in the rows that remain, and the risk budget, order summary, and Apply availability all follow the applicable subset. Exclusions are cleared when a new preview starts.
 - Saves the ordered rule stack as a named **preset** and loads it again later or on another machine. Presets are versioned JSON files that contain only rules — never file paths — so loading one cannot point the app at a folder you did not choose. Saving writes through a temporary file plus a rename, so an interrupted save cannot leave a half-written preset, and a preset can be deleted from the shell behind a confirmation.
 - Makes numbering order explicit (the **Order Observatory**): the shell offers Path, Name, Modified (oldest first), and Capture date (oldest first, from JPEG Exif) as the numbering/processing order, states the chosen order and the assigned counter range with every preview, and records the order in the plan and journal. Every order falls back to the stable path key on ties. The planner also warns about possible **sequence gaps** — holes in a numbered pattern (for example `IMG_0001, IMG_0002, IMG_0004`) in the proposed names; a gap is a warning, never a block, because it can be legitimate.
 - Validates empty names, invalid Windows filename characters, reserved DOS device names, trailing spaces/dots, the 255 UTF-16 code-unit filename-component limit, a conservative legacy path-length limit (destination paths over 259 UTF-16 code units are blocked), duplicate targets, and existing unselected targets.
@@ -24,7 +25,7 @@
 ## Intentionally not yet exposed or complete
 
 - Native file/folder picker and drag-and-drop intake (paste a path in the current shell). One folder is scanned per preview.
-- Per-row inclusion/exclusion, issue filters, sortable columns, and thumbnails.
+- Issue filters, sortable columns, and thumbnails. (Rows can already be included or excluded individually.)
 - Copy/move destination templates. `OperationKind::Copy` and `OperationKind::Move` exist in the core API, but the shell always plans renames.
 - CSV/JSON mapping and report export. These have **no implementation yet**, in the core or the UI. Presets store a rule stack only; they do not record which folder or files a job targeted.
 - A shell for the plan handoff core (`PlanFile`/`DriftReport`). Export, revalidation, and subset selection exist in the library and its tests, but there are no Save plan / Open plan controls yet.
@@ -59,7 +60,7 @@ cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (42 unit tests), and several validation paths are currently covered by code inspection only.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on Ubuntu for pushes to `main` and `arena/**` branches and for pull requests to `main`. The Windows release build is **not** part of CI, so it remains a manual gate. The automated test suite is small (43 unit tests), and several validation paths are currently covered by code inspection only.
 
 During development on a supported desktop platform:
 

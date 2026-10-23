@@ -2,7 +2,7 @@
 
 **Research date:** 2026-10-20 (America/Chicago)  
 **Provisional working name:** FileWeaver  
-**Implementation checkpoint:** The accompanying `0.1.0` source implements the first core slice (planner, validation, staged executor, local ledger, and a limited desktop shell). It does **not** yet implement this entire plan. In particular, current rollback uses a conservative size/modified-time fingerprint rather than stable Windows file identity, the UI now exposes the recovery ledger, the full ordered rule stack, and named rule presets, but it still does not expose move or copy destinations, per-row selection, or issue filtering. Two plan details differ in the current code and are worth knowing when reading §4 and §7: the conflict policy **blocks** a job that has any blocking issue rather than skipping individual rows (§4 item 17 describes the intended policy), and the implemented layout is a **single crate** with modules (`src/lib.rs` + `src/*.rs`, see the README's project layout), not the multi-crate workspace sketched in §7. See the README for exact current scope.  
+**Implementation checkpoint:** The accompanying `0.1.0` source implements the first core slice (planner, validation, staged executor, local ledger, and a limited desktop shell). It does **not** yet implement this entire plan. In particular, current rollback uses a conservative size/modified-time fingerprint rather than stable Windows file identity, the UI now exposes the recovery ledger, the full ordered rule stack, named rule presets, and per-row inclusion, but it still does not expose move or copy destinations, issue filtering, or plan handoff. Two plan details differ in the current code and are worth knowing when reading §4 and §7: the conflict policy **blocks** a job that has any blocking issue among the included rows; the planner never silently skips a row, although the shell now lets a user exclude a row explicitly (§4 item 17 describes the intended policy), and the implemented layout is a **single crate** with modules (`src/lib.rs` + `src/*.rs`, see the README's project layout), not the multi-crate workspace sketched in §7. See the README for exact current scope.  
 **Evidence standard:** Product facts below come from official product pages, manuals, release notes, or official Microsoft documentation. Feature marketing claims have not been independently benchmarked. “Not verified” means the official sources reviewed did not establish the point—not that the product lacks it.
 
 ## 1. Product definition and working assumptions
@@ -196,7 +196,7 @@ Build **Rename Ledger**, **Order Observatory**, **Risk Budget**, and **Rule-stag
 
 ## 7. Architecture & UX plan (before implementation)
 
-> **Status note (0.1.0):** this section is the pre-implementation plan and is written in the present tense, but the shipped shell is much smaller: a paste-a-path field, three rules (prefix, literal replace, counter), Scan / Refresh / Apply, and a status line. There is no drag-and-drop, no template picker, no per-row exclusion, no progress/stop UI, no report, and no undo surface yet, and the palette is a fixed light theme. Where this section and the README disagree, the README describes the shipped build. Toolchain and build instructions live in the README.
+> **Status note (0.1.0):** this section is the pre-implementation plan and is written in the present tense, but the shipped shell is smaller: a pasted folder path with optional subfolders, an ordered rule stack (prefix, suffix, literal replace, regex, case, whitespace, extension, date, counter), named presets, per-row inclusion, Scan / Refresh preview / Stop / Apply, a risk budget, rule-stage provenance, and a recovery ledger with confirmed rollback. Still absent: drag-and-drop intake, file picker, issue filters, sortable columns, thumbnails, progress bar, report export, folder mutation, move/copy destinations in the UI, and theme support. Where this section and the README disagree, the README describes the shipped build.
 
 ### UI framework choice
 
@@ -228,7 +228,7 @@ fileweaver/
 ```
 
 - **Pure planning path:** input snapshots + rules → immutable proposed actions + warnings/errors. It performs no writes and is unit-testable.
-- **Execution path:** only validated, selected actions go to a bounded worker. It reports structured events to the UI and commits journal status after meaningful transitions. *(0.1.0: no per-row selection exists — all non-blocked, changing actions run, on one background thread per apply.)*
+- **Execution path:** only validated, selected actions go to a bounded worker. It reports structured events to the UI and commits journal status after meaningful transitions. *(0.1.0: the shell can exclude rows, but there is no partial selection of rules, and the included actions run on one background thread per apply.)*
 - **Journal/recovery path:** rollback records its outcome on the original job's item rows; it never “pretends” that a divergent file was restored.
 - **UI path:** keeps file I/O, Exif parsing, and traversal off the UI event loop. Virtualized rows and a bounded thumbnail cache are design targets; 0.1.0 renders all preview rows directly, and has no thumbnails or hashing.
 
@@ -291,7 +291,7 @@ fileweaver/
 
 ### Verification plan before any “complete” claim
 
-The lists below are the *planned* coverage, not the current suite: 0.1.0 has 42 unit tests (see the README's Build and verify section).
+The lists below are the *planned* coverage, not the current suite: 0.1.0 has 43 unit tests (see the README's Build and verify section).
 
 - Core unit tests: name parsing, sort determinism, rule composition, invalid names, collisions, counters, CSV import, Exif absence/corruption, and journal transitions.
 - Integration tests in disposable directories: cycles, case-only changes, duplicate targets, cancellations, permissions, interrupted jobs, cross-volume simulations where feasible, and divergent rollback.
