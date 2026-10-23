@@ -11,6 +11,7 @@ pub mod handoff;
 pub mod journal;
 pub mod metadata;
 pub mod planner;
+pub mod presets;
 pub mod rules;
 
 pub use domain::{
@@ -23,4 +24,8 @@ pub use executor::{
 pub use handoff::{DriftReport, DriftState, HandoffAction, HandoffError, PlanFile, RowDrift};
 pub use journal::{JobSummary, Journal, JournalError, RollbackReport};
 pub use planner::{PlanError, plan, subset_plan};
+pub use presets::{
+    PRESET_FORMAT, PRESET_FORMAT_VERSION, PresetError, PresetFile, PresetListing, PresetStore,
+    PresetSummary,
+};
 pub use rules::{CaseStyle, DateSource, Rule, RulePipeline, RuleProblem};
