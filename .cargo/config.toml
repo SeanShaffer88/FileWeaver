@@ -1,0 +1,5 @@
+# Static CRT for the shipped Windows build (Core Engineering Contract v2.6
+# §0/§2): the MSVC C runtime is linked into the binary, so no separate
+# VC++ redistributable install is required on the target machine.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
