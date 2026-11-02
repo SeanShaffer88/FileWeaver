@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach assets to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Resolve version
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $ver = $tag -replace '^v', ''
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Building release $tag (version $ver)"
+      - name: Gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Package installer (NSIS)
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $ver = "${{ steps.meta.outputs.ver }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            $candidate = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+            if (Test-Path $candidate) { $makensis = $candidate }
+          }
+          if (-not $makensis) {
+            choco install nsis -y --no-progress
+            $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          }
+          if (-not (Test-Path $makensis)) { throw "makensis.exe not found" }
+          & $makensis "/DAppVersion=$ver" "installer/FileWeaver.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Rename-Item "dist/FileWeaver-Setup.exe" "FileWeaver-$tag-x64-Setup.exe"
+          Get-ChildItem dist | Select-Object Name, Length
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          New-Item -ItemType Directory -Force -Path "dist/portable" | Out-Null
+          Copy-Item target/release/fileweaver.exe "dist/portable/"
+          Copy-Item README.md "dist/portable/"
+          Copy-Item LICENSE "dist/portable/"
+          Copy-Item PORTABLE.txt "dist/portable/"
+          Compress-Archive -Path "dist/portable/*" -DestinationPath "dist/FileWeaver-$tag-x64-Portable.zip"
+          Get-ChildItem dist | Select-Object Name, Length
+      - name: Write SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $assets = @(
+            "FileWeaver-$tag-x64-Setup.exe",
+            "FileWeaver-$tag-x64-Portable.zip"
+          )
+          $lines = foreach ($name in $assets) {
+            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name"
+          }
+          $lines | Set-Content "dist/SHA256SUMS.txt" -Encoding ascii
+          Get-Content "dist/SHA256SUMS.txt"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: |
+            dist/FileWeaver-${{ steps.meta.outputs.tag }}-x64-Setup.exe
+            dist/FileWeaver-${{ steps.meta.outputs.tag }}-x64-Portable.zip
+            dist/SHA256SUMS.txt

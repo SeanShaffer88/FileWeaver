@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Tier classification lint (contract section 6)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ".project-tier")) {
+            throw ".project-tier is missing; every repo must declare its tier"
+          }
+          $tier = (Get-Content ".project-tier" -Raw).Trim()
+          if ($tier -ne "t3") {
+            throw ".project-tier declares '$tier' but this repo is classified t3 in AGENTS.md"
+          }
+      - name: Gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
