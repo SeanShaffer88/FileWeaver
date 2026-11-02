@@ -2,7 +2,7 @@
 
 All notable changes to FileWeaver are recorded here.
 
-## 0.2.0 — Unreleased
+## 0.2.0 — 2026-11-01
 
 - **Portable data directory.** The operation ledger moved to `data\operations.sqlite` beside the executable. A ledger at the previous per-user location is copied across on first run (the original file is left untouched as a backup); if the folder beside the executable cannot be written, the per-user location is used as a fallback.
 - **Ledger schema versioning.** The ledger records a schema version (`PRAGMA user_version`, now 1) and migrates explicitly on open. A ledger written by a newer schema is rejected with an explanation instead of being reset.
