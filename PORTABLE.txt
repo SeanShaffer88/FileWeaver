@@ -1,0 +1,27 @@
+FileWeaver — portable build
+===========================
+
+No installation needed: unzip this archive anywhere and run
+fileweaver.exe.
+
+Where your data lives
+---------------------
+FileWeaver keeps its operation ledger (the record of applied jobs that
+makes rollback possible) in a "data" folder beside the executable:
+data\operations.sqlite. Nothing is written to %APPDATA%, the registry,
+or anywhere else. If the folder beside the executable cannot be written,
+the ledger falls back to the per-user location
+%LOCALAPPDATA%\FileWeaver\operations.sqlite instead.
+
+Erasing your data
+-----------------
+Run `fileweaver --clean` (or delete the data folder) to remove the
+ledger and its history. Rollback history is lost when the ledger is
+deleted.
+
+Requirements
+------------
+Windows 10 (build 19041) or later, x64. The executable is self-contained:
+no separate runtime install is required.
+
+License: MIT — see LICENSE.
