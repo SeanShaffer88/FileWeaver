@@ -60,6 +60,7 @@ pub struct RecoverableItem {
     pub reason: Option<String>,
     pub source_fingerprint: FileFingerprint,
     pub status: String,
+    pub result_fingerprint: Option<FileFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +209,33 @@ impl Journal {
         Ok(())
     }
 
+    pub fn mark_materializing(
+        &self,
+        job_id: i64,
+        index: usize,
+        destination: &Path,
+        copy: bool,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE job_items SET status = 'materializing', temp_path = CASE WHEN ?1 THEN ?2 ELSE temp_path END WHERE job_id = ?3 AND item_index = ?4",
+            params![copy, path_text(destination), job_id, i64::try_from(index).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_rollback_staged(
+        &self,
+        job_id: i64,
+        index: usize,
+        temp: &Path,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE job_items SET status = 'rollback_staged', temp_path = ?1 WHERE job_id = ?2 AND item_index = ?3",
+            params![path_text(temp), job_id, i64::try_from(index).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_applied(
         &self,
         job_id: i64,
@@ -257,13 +285,13 @@ impl Journal {
 
     pub fn recoverable_items(&self, job_id: i64) -> Result<Vec<RecoverableItem>, JournalError> {
         let mut statement = self.connection.prepare(
-            "SELECT item_index, source_path, destination_path, temp_path, error_message, source_size, source_modified_ns, status
-             FROM job_items WHERE job_id = ?1 AND temp_path IS NOT NULL
-             AND status IN ('staged', 'failed', 'recovery_pending', 'materialized', 'rollback_staged')
+            "SELECT item_index, source_path, destination_path, COALESCE(temp_path, destination_path), error_message, source_size, source_modified_ns, status, result_size, result_modified_ns
+             FROM job_items WHERE job_id = ?1 AND ((temp_path IS NOT NULL AND status IN ('staged', 'failed', 'recovery_pending', 'rollback_staged')) OR status IN ('materializing', 'materialized'))
              ORDER BY item_index DESC",
         )?;
         let items = statement
             .query_map(params![job_id], |row| {
+                let result_modified: Option<String> = row.get(9)?;
                 Ok(RecoverableItem {
                     index: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
                     source: PathBuf::from(row.get::<_, String>(1)?),
@@ -277,6 +305,10 @@ impl Journal {
                             .and_then(|value| value.parse().ok()),
                     },
                     status: row.get(7)?,
+                    result_fingerprint: row.get::<_, Option<i64>>(8)?.map(|size| FileFingerprint {
+                        size_bytes: u64::try_from(size).unwrap_or(0),
+                        modified_unix_nanos: result_modified.and_then(|value| value.parse().ok()),
+                    }),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

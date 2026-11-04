@@ -100,9 +100,11 @@ impl JobReview {
                 .pending
                 .iter()
                 .filter(|item| {
-                    !item.source.exists()
-                        && fingerprint(pending_recovery_path(item)).ok().as_ref()
-                            == Some(&item.source_fingerprint)
+                    self.operation != OperationKind::Copy
+                        && !item.source.exists()
+                        && pending_recovery_path(item).is_some_and(|(path, expected)| {
+                            fingerprint(path).ok().as_ref() == Some(expected)
+                        })
                 })
                 .count()
     }
@@ -209,6 +211,12 @@ impl Executor {
                 } else {
                     &action.snapshot.source
                 };
+                self.journal.mark_materializing(
+                    job_id,
+                    action.index,
+                    &action.destination,
+                    !needs_staging,
+                )?;
                 if let Err(error) =
                     move_or_copy_to_target(source, &action.destination, needs_staging)
                 {
@@ -333,15 +341,30 @@ impl Executor {
         }
         let pending = self.journal.recoverable_items(job_id)?;
         for item in pending {
-            let path = pending_recovery_path(&item);
-            if fingerprint(path).ok().as_ref() != Some(&item.source_fingerprint) {
+            let Some((path, expected)) =
+                pending_recovery_path(&item).filter(|_| kind != OperationKind::Copy)
+            else {
+                report.skipped.push(RollbackBlockedItem {
+                    index: item.index, destination: item.destination.clone(),
+                    reason: format!("Ownership is uncertain; manual review required for {} and {} (status {}). No files changed.", item.temp.display(), item.destination.display(), item.status),
+                });
+                continue;
+            };
+            if fingerprint(path).ok().as_ref() != Some(expected) {
                 report.skipped.push(RollbackBlockedItem {
                     index: item.index, destination: path.to_path_buf(),
                     reason: format!("Recovery content is missing or differs from the recorded source; inspect {} and {} before manual recovery (status {}).", item.temp.display(), item.destination.display(), item.status),
                 });
                 continue;
             }
-            let result = recover_item(&self.journal, job_id, item.index, &item.source, path);
+            let result = recover_item(
+                &self.journal,
+                job_id,
+                item.index,
+                &item.source,
+                path,
+                item.status == "rollback_staged",
+            );
             report.restored += result.restored.len();
             for (path, reason) in result.retained {
                 report.skipped.push(RollbackBlockedItem {
@@ -395,12 +418,20 @@ impl Executor {
     }
 }
 
-fn pending_recovery_path(item: &crate::journal::RecoverableItem) -> &Path {
-    if !item.temp.exists() && matches!(item.status.as_str(), "materialized" | "staged") {
-        &item.destination
-    } else {
-        &item.temp
+fn pending_recovery_path(
+    item: &crate::journal::RecoverableItem,
+) -> Option<(&Path, &FileFingerprint)> {
+    // Only an existing recorded stage is recovery evidence. A missing stage
+    // never establishes ownership of the destination or original location.
+    if !item.temp.exists() || matches!(item.status.as_str(), "materializing" | "materialized") {
+        return None;
     }
+    let expected = if item.status == "rollback_staged" {
+        item.result_fingerprint.as_ref()?
+    } else {
+        &item.source_fingerprint
+    };
+    Some((&item.temp, expected))
 }
 
 fn preflight_rollback(items: Vec<AppliedItem>) -> (Vec<AppliedItem>, RollbackReport) {
@@ -461,7 +492,7 @@ fn rollback_moves(
                 continue;
             }
         };
-        if let Err(error) = journal.mark_staged(job_id, item.index, &temp) {
+        if let Err(error) = journal.mark_rollback_staged(job_id, item.index, &temp) {
             report.skipped.push(RollbackBlockedItem {
                 index: item.index,
                 destination: item.destination,
@@ -511,7 +542,7 @@ fn rollback_moves(
                 if let Err(error) = journal.mark_rollback_status(
                     job_id,
                     item.index,
-                    "recovery_pending",
+                    "rollback_staged",
                     Some(&reason),
                 ) {
                     report.skipped.push(RollbackBlockedItem {
@@ -545,6 +576,7 @@ fn recover_item(
     index: usize,
     source: &Path,
     temp: &Path,
+    rollback: bool,
 ) -> RecoveryResult {
     let mut result = RecoveryResult::default();
     let (status, reason) = match move_without_overwrite(temp, source) {
@@ -560,7 +592,14 @@ fn recover_item(
             );
             result.filesystem_errors.push(error.to_string());
             result.retained.push((temp.to_path_buf(), reason.clone()));
-            ("recovery_pending", Some(reason))
+            (
+                if rollback {
+                    "rollback_staged"
+                } else {
+                    "recovery_pending"
+                },
+                Some(reason),
+            )
         }
     };
     if let Err(error) = journal.mark_rollback_status(job_id, index, status, reason.as_deref()) {
@@ -580,7 +619,14 @@ fn restore_staged(
 ) -> RecoveryResult {
     let mut result = RecoveryResult::default();
     for (action, temp) in staged.iter().rev() {
-        let item = recover_item(journal, job_id, action.index, &action.snapshot.source, temp);
+        let item = recover_item(
+            journal,
+            job_id,
+            action.index,
+            &action.snapshot.source,
+            temp,
+            false,
+        );
         result.restored.extend(item.restored);
         result.retained.extend(item.retained);
         result.filesystem_errors.extend(item.filesystem_errors);
@@ -723,7 +769,19 @@ fn move_without_overwrite(source: &Path, target: &Path) -> Result<(), ExecuteErr
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_FINGERPRINT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn fingerprint(path: &Path) -> Result<FileFingerprint, ExecuteError> {
+    #[cfg(test)]
+    if FAIL_FINGERPRINT.with(|failure| failure.borrow().as_deref() == Some(path)) {
+        return Err(ExecuteError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other("injected fingerprint failure"),
+        });
+    }
     fs::metadata(path)
         .map(|metadata| FileFingerprint::from_metadata(&metadata))
         .map_err(|source| ExecuteError::Io {
@@ -807,6 +865,143 @@ mod tests {
             },
             sequence_gaps: vec![],
         }
+    }
+
+    #[test]
+    fn copy_recording_failures_remain_reviewable_after_reopen_and_retry() {
+        // Test fixture operations are expected to succeed.
+        for fail_fingerprint in [true, false] {
+            let directory = tempdir().unwrap();
+            let root = directory.path();
+            fs::write(root.join("a.txt"), "A").unwrap();
+            fs::write(root.join("b.txt"), "B").unwrap();
+            let database = root.join("operations.sqlite");
+            let mut plan = manual_swap_plan(root);
+            plan.request.operation = OperationKind::Copy;
+            plan.actions.truncate(1);
+            plan.actions[0].destination = root.join("copy.txt");
+            let mut executor = Executor::new(Journal::open(&database).unwrap());
+            if fail_fingerprint {
+                FAIL_FINGERPRINT
+                    .with(|failure| *failure.borrow_mut() = Some(root.join("copy.txt")));
+            } else {
+                rusqlite::Connection::open(&database).unwrap().execute_batch(
+                    "CREATE TRIGGER fail_applied BEFORE UPDATE ON job_items WHEN NEW.status = 'applied' BEGIN SELECT RAISE(FAIL, 'injected applied failure'); END;"
+                ).unwrap();
+            }
+            assert!(
+                executor
+                    .execute(&plan, &CancellationToken::default(), |_| {})
+                    .is_err()
+            );
+            FAIL_FINGERPRINT.with(|failure| *failure.borrow_mut() = None);
+            drop(executor);
+            let mut executor = Executor::new(Journal::open(&database).unwrap());
+            let job = executor.journal().list_jobs(1).unwrap()[0].id;
+            assert_eq!(executor.review(job).unwrap().pending.len(), 1);
+            assert!(executor.journal().applied_items(job).unwrap().is_empty());
+            for _ in 0..2 {
+                let report = executor.rollback(job).unwrap();
+                assert_eq!(report.restored, 0);
+                assert_eq!(report.removed_copies, 0);
+                assert_eq!(report.skipped.len(), 1);
+                assert_eq!(fs::read(root.join("copy.txt")).unwrap(), b"A");
+                assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+            }
+            // Legacy NULL materialization paths remain visible too.
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "UPDATE job_items SET temp_path = NULL WHERE status = 'materialized'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(executor.review(job).unwrap().pending.len(), 1);
+        }
+    }
+
+    #[test]
+    fn interrupted_swap_rollback_never_falls_back_to_foreign_destination() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let timestamp = fs::metadata(root.join("a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(root.join("b.txt"))
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+        let database = root.join("operations.sqlite");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        let job = executor
+            .execute(
+                &manual_swap_plan(root),
+                &CancellationToken::default(),
+                |_| {},
+            )
+            .unwrap()
+            .job_id;
+        rusqlite::Connection::open(&database).unwrap().execute_batch(
+            "CREATE TRIGGER fail_terminal BEFORE UPDATE ON job_items WHEN NEW.status = 'rolled_back' BEGIN SELECT RAISE(FAIL, 'injected terminal failure'); END;"
+        ).unwrap();
+        assert_eq!(executor.rollback(job).unwrap().restored, 2);
+        drop(executor);
+        fs::remove_file(root.join("a.txt")).unwrap();
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        assert_eq!(executor.rollback(job).unwrap().restored, 0);
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+        assert!(!root.join("a.txt").exists());
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute("UPDATE job_items SET status = 'staged'", [])
+            .unwrap();
+        assert_eq!(executor.rollback(job).unwrap().restored, 0);
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+    }
+
+    #[test]
+    fn rollback_stage_retry_uses_result_timestamp_after_reopen() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut plan = manual_swap_plan(root);
+        plan.actions.truncate(1);
+        plan.request.operation = OperationKind::Move;
+        let mut journal = Journal::open(&database).unwrap();
+        let job = journal.create_job(&plan).unwrap();
+        let temp = root.join("rollback.partial");
+        fs::rename(root.join("a.txt"), &temp).unwrap();
+        let result_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_modified(result_time)
+            .unwrap();
+        let result = fingerprint(&temp).unwrap();
+        assert_ne!(result, plan.actions[0].snapshot.fingerprint);
+        journal.mark_applied(job, 0, &result).unwrap();
+        journal.mark_rollback_staged(job, 0, &temp).unwrap();
+        fs::write(root.join("a.txt"), "occupied").unwrap();
+        drop(journal);
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        assert_eq!(executor.rollback(job).unwrap().restored, 0);
+        assert!(temp.exists());
+        drop(executor);
+        fs::remove_file(root.join("a.txt")).unwrap();
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        assert_eq!(executor.rollback(job).unwrap().restored, 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
     }
 
     #[test]
@@ -943,7 +1138,7 @@ mod tests {
         let mut executor = Executor::new(Journal::open(&database).unwrap());
         let error = executor.execute(&plan, &CancellationToken::default(), |_| {
             rusqlite::Connection::open(&database).unwrap().execute_batch(
-                "CREATE TRIGGER fail_updates BEFORE UPDATE ON job_items BEGIN SELECT RAISE(FAIL, 'injected ledger failure'); END;"
+                "CREATE TRIGGER fail_updates BEFORE UPDATE ON job_items WHEN NEW.status != 'materializing' BEGIN SELECT RAISE(FAIL, 'injected ledger failure'); END;"
             ).unwrap();
         }).unwrap_err();
         assert!(error.to_string().contains("c.txt"));
@@ -965,8 +1160,8 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_updates;")
             .unwrap();
         let mut executor = Executor::new(Journal::open(root.join("operations.sqlite")).unwrap());
-        assert_eq!(executor.rollback(job).unwrap().restored, 1);
-        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(executor.rollback(job).unwrap().restored, 0);
+        assert_eq!(fs::read(root.join("c.txt")).unwrap(), b"A");
         assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
     }
 
@@ -1015,7 +1210,7 @@ mod tests {
         fs::rename(root.join("a.txt"), &temp).unwrap();
         // A missing original parent forces a filesystem restoration failure.
         let source = root.join("missing-parent/a.txt");
-        let result = recover_item(&journal, job, 0, &source, &temp);
+        let result = recover_item(&journal, job, 0, &source, &temp, false);
         assert_eq!(result.filesystem_errors.len(), 1);
         assert_eq!(result.retained[0].0, temp);
         drop(journal);

@@ -1232,13 +1232,13 @@ fn review_detail_text(review: &JobReview) -> String {
     }
     for item in &review.pending {
         text.push_str(&format!(
-            " Pending recovery: {} → {} (destination {}; {}).",
+            " Pending recovery: recorded location {}; original {}; destination {} ({}).",
             item.temp.display(),
             item.source.display(),
             item.destination.display(),
-            item.reason.as_deref().unwrap_or(
-                "interrupted staging intent; retry will not overwrite an occupied original"
-            )
+            item.reason
+                .as_deref()
+                .unwrap_or("interrupted intent; uncertain ownership requires manual review")
         ));
     }
     let reversible = review.safely_reversible();
