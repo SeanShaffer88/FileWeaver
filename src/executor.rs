@@ -1155,7 +1155,7 @@ mod tests {
                 .any(|item| item.destination == root.join("c.txt"))
         );
         drop(journal);
-        rusqlite::Connection::open(&root.join("operations.sqlite"))
+        rusqlite::Connection::open(root.join("operations.sqlite"))
             .unwrap()
             .execute_batch("DROP TRIGGER fail_updates;")
             .unwrap();
