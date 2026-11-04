@@ -34,6 +34,11 @@ pub struct ExecuteProgress {
 pub enum ExecuteError {
     #[error("the plan has blocking errors or no ready changes")]
     PlanNotExecutable,
+    #[error("{cause}; recovery: {recovery:?}")]
+    Recovery {
+        cause: String,
+        recovery: RecoveryResult,
+    },
     #[error("operation journal error: {0}")]
     Journal(#[from] JournalError),
     #[error("filesystem error while handling {path}: {source}")]
@@ -73,6 +78,7 @@ pub struct JobReview {
     pub job_id: i64,
     pub operation: OperationKind,
     pub items: Vec<ItemReview>,
+    pub pending: Vec<crate::journal::RecoverableItem>,
 }
 
 impl JobReview {
@@ -90,6 +96,15 @@ impl JobReview {
             .iter()
             .filter(|review| review.divergence == Divergence::Intact && !review.original_occupied)
             .count()
+            + self
+                .pending
+                .iter()
+                .filter(|item| {
+                    !item.source.exists()
+                        && fingerprint(pending_recovery_path(item)).ok().as_ref()
+                            == Some(&item.source_fingerprint)
+                })
+                .count()
     }
 }
 
@@ -135,161 +150,150 @@ impl Executor {
             OperationKind::Rename | OperationKind::Move
         );
 
-        if needs_staging {
-            for action in &actions {
-                if cancellation.is_cancelled() {
-                    restore_staged(&self.journal, job_id, &staged);
-                    self.journal.finish_job(
-                        job_id,
-                        "cancelled",
-                        Some("Cancelled before applying staged items."),
-                    )?;
-                    return Ok(JobOutcome {
-                        job_id,
-                        applied: 0,
-                        skipped: 0,
-                        failed: 0,
-                        cancelled: true,
-                    });
-                }
-                if action.snapshot.is_directory {
-                    self.journal.mark_failed(
-                        job_id,
-                        action.index,
-                        "Directory move/rename execution is deferred in this build.",
-                    )?;
-                    restore_staged(&self.journal, job_id, &staged);
-                    self.journal.finish_job(
-                        job_id,
-                        "failed",
-                        Some("Directory operation is not supported."),
-                    )?;
-                    return Err(ExecuteError::UnsupportedDirectory(
-                        action.snapshot.source.clone(),
-                    ));
-                }
-
-                let temporary = unique_temp_path(&action.snapshot.source, job_id, action.index)?;
-                // Persist the intended recovery path before changing the source.
-                self.journal.mark_staged(job_id, action.index, &temporary)?;
-                move_without_overwrite(&action.snapshot.source, &temporary)?;
-                staged.push((action.clone(), temporary));
-            }
-        }
-
-        let mut outcome = JobOutcome {
-            job_id,
-            applied: 0,
-            skipped: 0,
-            failed: 0,
-            cancelled: false,
-        };
-
-        for (position, action) in actions.iter().enumerate() {
-            if cancellation.is_cancelled() {
-                outcome.cancelled = true;
-                // Anything still staged was not yet materialized. Restore it;
-                // previously applied items remain safely undoable from the ledger.
-                let remaining = staged
-                    .iter()
-                    .filter(|(staged_action, _)| staged_action.index >= action.index)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                restore_staged(&self.journal, job_id, &remaining);
-                self.journal.finish_job(
-                    job_id,
-                    "cancelled",
-                    Some("Stopped safely between items; completed items can be undone."),
-                )?;
-                return Ok(outcome);
-            }
-
-            progress(ExecuteProgress {
-                completed: position,
-                total,
-                current_path: action.snapshot.source.clone(),
-                message: "Applying change".into(),
-            });
-
-            let source = match plan.request.operation {
-                OperationKind::Copy => &action.snapshot.source,
-                OperationKind::Rename | OperationKind::Move => {
-                    match staged
-                        .iter()
-                        .find(|(staged_action, _)| staged_action.index == action.index)
-                        .map(|(_, temporary)| temporary)
-                    {
-                        Some(temporary) => temporary,
-                        None => {
-                            // Cannot happen for a plan the planner produced
-                            // (every rename/move action is staged before the
-                            // apply loop), but a panic here would strand the
-                            // job mid-flight; fail it cleanly instead.
-                            self.journal.mark_failed(
-                                job_id,
-                                action.index,
-                                "Internal staging mismatch.",
-                            )?;
-                            let remaining = staged
-                                .iter()
-                                .filter(|(staged_action, _)| staged_action.index >= action.index)
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            restore_staged(&self.journal, job_id, &remaining);
-                            self.journal.finish_job(
-                                job_id,
-                                "failed",
-                                Some("Internal staging mismatch."),
-                            )?;
-                            return Err(ExecuteError::StagingMismatch(
-                                action.snapshot.source.clone(),
-                            ));
-                        }
+        let result = (|| -> Result<JobOutcome, ExecuteError> {
+            if needs_staging {
+                for action in &actions {
+                    if cancellation.is_cancelled() {
+                        break;
                     }
+                    if action.snapshot.is_directory {
+                        return Err(ExecuteError::UnsupportedDirectory(
+                            action.snapshot.source.clone(),
+                        ));
+                    }
+                    let temporary =
+                        unique_temp_path(&action.snapshot.source, job_id, action.index)?;
+                    self.journal.mark_staged(job_id, action.index, &temporary)?;
+                    if let Err(error) = move_without_overwrite(&action.snapshot.source, &temporary)
+                    {
+                        let persistence =
+                            self.journal
+                                .mark_failed(job_id, action.index, &error.to_string());
+                        return Err(ExecuteError::Recovery {
+                            cause: format!(
+                                "{error}; staging intent at {}; journal update: {persistence:?}",
+                                temporary.display()
+                            ),
+                            recovery: RecoveryResult::default(),
+                        });
+                    }
+                    staged.push((action.clone(), temporary));
                 }
+            }
+            let mut outcome = JobOutcome {
+                job_id,
+                applied: 0,
+                skipped: 0,
+                failed: 0,
+                cancelled: false,
             };
-
-            let result = match plan.request.operation {
-                OperationKind::Rename | OperationKind::Move => {
-                    move_or_copy_to_target(source, &action.destination, true)
+            for (position, action) in actions.iter().enumerate() {
+                if cancellation.is_cancelled() {
+                    outcome.cancelled = true;
+                    break;
                 }
-                OperationKind::Copy => move_or_copy_to_target(source, &action.destination, false),
-            };
-            match result {
-                Ok(()) => {
-                    let fingerprint = fingerprint(&action.destination)?;
+                progress(ExecuteProgress {
+                    completed: position,
+                    total,
+                    current_path: action.snapshot.source.clone(),
+                    message: "Applying change".into(),
+                });
+                let source = if needs_staging {
+                    staged
+                        .iter()
+                        .find(|(item, _)| item.index == action.index)
+                        .map(|(_, path)| path.as_path())
+                        .ok_or_else(|| {
+                            ExecuteError::StagingMismatch(action.snapshot.source.clone())
+                        })?
+                } else {
+                    &action.snapshot.source
+                };
+                if let Err(error) =
+                    move_or_copy_to_target(source, &action.destination, needs_staging)
+                {
+                    self.journal
+                        .mark_failed(job_id, action.index, &error.to_string())?;
+                    outcome.failed += 1;
+                    break;
+                }
+                // Materialized items must never be restored from their now absent stage.
+                staged.retain(|(item, _)| item.index != action.index);
+                let recorded = fingerprint(&action.destination).and_then(|fingerprint| {
                     self.journal
                         .mark_applied(job_id, action.index, &fingerprint)?;
-                    outcome.applied += 1;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    self.journal.mark_failed(job_id, action.index, &message)?;
-                    outcome.failed += 1;
-                    let remaining = staged
-                        .iter()
-                        .filter(|(staged_action, _)| staged_action.index > action.index)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    restore_staged(&self.journal, job_id, &remaining);
-                    self.journal.finish_job(
+                    Ok(())
+                });
+                if let Err(error) = recorded {
+                    // The pre-mutation staging intent remains durable even if this write fails.
+                    let persistence = self.journal.mark_rollback_status(
                         job_id,
-                        "failed",
-                        Some(
-                            "One or more changes failed. Applied items remain available for undo.",
+                        action.index,
+                        "materialized",
+                        Some(&error.to_string()),
+                    );
+                    return Err(ExecuteError::Recovery {
+                        cause: format!(
+                            "{error}; materialized file at {}; journal update: {persistence:?}",
+                            action.destination.display()
                         ),
-                    )?;
-                    return Ok(outcome);
+                        recovery: RecoveryResult {
+                            retained: vec![(action.destination.clone(), error.to_string())],
+                            ..RecoveryResult::default()
+                        },
+                    });
                 }
+                outcome.applied += 1;
             }
-        }
-
-        self.journal.finish_job(job_id, "completed", None)?;
+            Ok(outcome)
+        })();
+        // This runs for every fallible exit after staging, independently of journal health.
+        let mut recovery = restore_staged(&self.journal, job_id, &staged);
+        let result = match result {
+            Err(ExecuteError::Recovery {
+                cause,
+                recovery: materialized,
+            }) => {
+                recovery.retained.extend(materialized.retained);
+                recovery
+                    .filesystem_errors
+                    .extend(materialized.filesystem_errors);
+                recovery.journal_errors.extend(materialized.journal_errors);
+                Err(ExecuteError::Recovery {
+                    cause,
+                    recovery: RecoveryResult::default(),
+                })
+            }
+            other => other,
+        };
+        let outcome = match result {
+            Ok(outcome) if recovery.retained.is_empty() && recovery.journal_errors.is_empty() => {
+                outcome
+            }
+            other => {
+                let cause = match other {
+                    Ok(_) => "staging recovery incomplete".into(),
+                    Err(error) => error.to_string(),
+                };
+                if let Err(error) = self.journal.finish_job(job_id, "failed", Some(&cause)) {
+                    recovery.journal_errors.push(error.to_string());
+                }
+                return Err(ExecuteError::Recovery { cause, recovery });
+            }
+        };
+        let status = if outcome.cancelled {
+            "cancelled"
+        } else if outcome.failed > 0 {
+            "failed"
+        } else {
+            "completed"
+        };
+        self.journal.finish_job(job_id, status, None)?;
         progress(ExecuteProgress {
             completed: total,
             total,
             current_path: PathBuf::new(),
-            message: "Completed".into(),
+            message: status.into(),
         });
         Ok(outcome)
     }
@@ -327,6 +331,33 @@ impl Executor {
                 rollback_moves(&mut self.journal, job_id, safe, &mut report)?;
             }
         }
+        let pending = self.journal.recoverable_items(job_id)?;
+        for item in pending {
+            let path = pending_recovery_path(&item);
+            if fingerprint(path).ok().as_ref() != Some(&item.source_fingerprint) {
+                report.skipped.push(RollbackBlockedItem {
+                    index: item.index, destination: path.to_path_buf(),
+                    reason: format!("Recovery content is missing or differs from the recorded source; inspect {} and {} before manual recovery (status {}).", item.temp.display(), item.destination.display(), item.status),
+                });
+                continue;
+            }
+            let result = recover_item(&self.journal, job_id, item.index, &item.source, path);
+            report.restored += result.restored.len();
+            for (path, reason) in result.retained {
+                report.skipped.push(RollbackBlockedItem {
+                    index: item.index,
+                    destination: path,
+                    reason,
+                });
+            }
+            for reason in result.journal_errors {
+                report.skipped.push(RollbackBlockedItem {
+                    index: item.index,
+                    destination: item.temp.clone(),
+                    reason,
+                });
+            }
+        }
         Ok(report)
     }
 
@@ -359,7 +390,16 @@ impl Executor {
             job_id,
             operation,
             items,
+            pending: self.journal.recoverable_items(job_id)?,
         })
+    }
+}
+
+fn pending_recovery_path(item: &crate::journal::RecoverableItem) -> &Path {
+    if !item.temp.exists() && matches!(item.status.as_str(), "materialized" | "staged") {
+        &item.destination
+    } else {
+        &item.temp
     }
 }
 
@@ -421,31 +461,68 @@ fn rollback_moves(
                 continue;
             }
         };
+        if let Err(error) = journal.mark_staged(job_id, item.index, &temp) {
+            report.skipped.push(RollbackBlockedItem {
+                index: item.index,
+                destination: item.destination,
+                reason: format!("Could not persist rollback staging intent: {error}"),
+            });
+            continue;
+        }
         if let Err(error) = move_without_overwrite(&item.destination, &temp) {
             report.skipped.push(RollbackBlockedItem {
                 index: item.index,
                 destination: item.destination,
                 reason: format!("Could not stage for safe rollback: {error}"),
             });
+            if let Err(error) = journal.mark_rollback_status(job_id, item.index, "applied", None) {
+                report.skipped.push(RollbackBlockedItem {
+                    index: item.index,
+                    destination: temp,
+                    reason: error.to_string(),
+                });
+            }
             continue;
         }
-        journal.mark_rollback_status(job_id, item.index, "rollback_staged", None)?;
+        // The intent already records the actual rollback stage path.
         staged.push((item, temp));
     }
 
     for (item, temp) in staged {
         match move_or_copy_to_target(&temp, &item.source, true) {
             Ok(()) => {
-                journal.mark_rollback_status(job_id, item.index, "rolled_back", None)?;
+                if let Err(error) =
+                    journal.mark_rollback_status(job_id, item.index, "rolled_back", None)
+                {
+                    report.skipped.push(RollbackBlockedItem {
+                        index: item.index,
+                        destination: item.source.clone(),
+                        reason: format!("Original restored, but ledger update failed: {error}"),
+                    });
+                }
                 report.restored += 1;
             }
             Err(error) => {
-                // The temporary file remains in place so that the user does not
-                // lose content. The journal points to it through the original
-                // staged record, and the report is explicit.
+                let reason = format!(
+                    "Could not restore original {}; temporary file retained at {}: {error}",
+                    item.source.display(),
+                    temp.display()
+                );
+                if let Err(error) = journal.mark_rollback_status(
+                    job_id,
+                    item.index,
+                    "recovery_pending",
+                    Some(&reason),
+                ) {
+                    report.skipped.push(RollbackBlockedItem {
+                        index: item.index,
+                        destination: temp.clone(),
+                        reason: format!("Recovery status could not be persisted: {error}"),
+                    });
+                }
                 report.skipped.push(RollbackBlockedItem {
                     index: item.index,
-                    destination: item.destination,
+                    destination: temp.clone(),
                     reason: format!("Could not restore original location; temporary file retained at {}: {error}", temp.display()),
                 });
             }
@@ -454,20 +531,62 @@ fn rollback_moves(
     Ok(())
 }
 
-fn restore_staged(journal: &Journal, job_id: i64, staged: &[(PlannedAction, PathBuf)]) {
-    for (action, temp) in staged.iter().rev() {
-        if temp.exists() && !action.snapshot.source.exists() {
-            if let Err(error) = move_without_overwrite(temp, &action.snapshot.source) {
-                let _ = journal.mark_failed(
-                    job_id,
-                    action.index,
-                    &format!("Could not restore staging file {}: {error}", temp.display()),
-                );
-            } else {
-                let _ = journal.mark_rollback_status(job_id, action.index, "not_applied", None);
-            }
+#[derive(Debug, Default)]
+pub struct RecoveryResult {
+    pub restored: Vec<PathBuf>,
+    pub retained: Vec<(PathBuf, String)>,
+    pub filesystem_errors: Vec<String>,
+    pub journal_errors: Vec<String>,
+}
+
+fn recover_item(
+    journal: &Journal,
+    job_id: i64,
+    index: usize,
+    source: &Path,
+    temp: &Path,
+) -> RecoveryResult {
+    let mut result = RecoveryResult::default();
+    let (status, reason) = match move_without_overwrite(temp, source) {
+        Ok(()) => {
+            result.restored.push(source.to_path_buf());
+            ("not_applied", None)
         }
+        Err(error) => {
+            let reason = format!(
+                "Recovery file retained at {} for original {}: {error}",
+                temp.display(),
+                source.display()
+            );
+            result.filesystem_errors.push(error.to_string());
+            result.retained.push((temp.to_path_buf(), reason.clone()));
+            ("recovery_pending", Some(reason))
+        }
+    };
+    if let Err(error) = journal.mark_rollback_status(job_id, index, status, reason.as_deref()) {
+        result.journal_errors.push(format!(
+            "{} -> {}: {error}",
+            temp.display(),
+            source.display()
+        ));
     }
+    result
+}
+
+fn restore_staged(
+    journal: &Journal,
+    job_id: i64,
+    staged: &[(PlannedAction, PathBuf)],
+) -> RecoveryResult {
+    let mut result = RecoveryResult::default();
+    for (action, temp) in staged.iter().rev() {
+        let item = recover_item(journal, job_id, action.index, &action.snapshot.source, temp);
+        result.restored.extend(item.restored);
+        result.retained.extend(item.retained);
+        result.filesystem_errors.extend(item.filesystem_errors);
+        result.journal_errors.extend(item.journal_errors);
+    }
+    result
 }
 
 fn move_or_copy_to_target(
@@ -647,12 +766,14 @@ mod tests {
                 index,
                 snapshot: FileSnapshot {
                     original_name: source.into(),
-                    source: source_path,
+                    source: source_path.clone(),
                     is_directory: false,
-                    fingerprint: FileFingerprint {
-                        size_bytes: 1,
-                        modified_unix_nanos: None,
-                    },
+                    fingerprint: fs::metadata(&source_path)
+                        .map(|metadata| FileFingerprint::from_metadata(&metadata))
+                        .unwrap_or(FileFingerprint {
+                            size_bytes: 1,
+                            modified_unix_nanos: None,
+                        }),
                     modified_unix_nanos: None,
                     jpeg_exif_datetime: None,
                 },
@@ -686,6 +807,229 @@ mod tests {
             },
             sequence_gaps: vec![],
         }
+    }
+
+    #[test]
+    fn second_stage_failure_restores_first_and_reopens_history() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        assert!(
+            executor
+                .execute(
+                    &manual_swap_plan(root),
+                    &CancellationToken::default(),
+                    |_| {}
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        drop(executor);
+        let journal = Journal::open(database).unwrap();
+        let jobs = journal.list_jobs(10).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(
+            journal
+                .recoverable_items(jobs[0].id)
+                .unwrap()
+                .iter()
+                .all(|item| item.source != root.join("a.txt"))
+        );
+    }
+
+    #[test]
+    fn appeared_destination_restores_current_and_remaining_stages() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let mut plan = manual_swap_plan(root);
+        plan.actions[0].destination = root.join("occupied.txt");
+        fs::write(root.join("occupied.txt"), "sentinel").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        let outcome = executor
+            .execute(&plan, &CancellationToken::default(), |_| {})
+            .unwrap();
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+        assert_eq!(fs::read(root.join("occupied.txt")).unwrap(), b"sentinel");
+        drop(executor);
+        assert!(
+            Journal::open(database)
+                .unwrap()
+                .recoverable_items(outcome.job_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn occupied_original_retains_stage_and_retry_preserves_sentinel() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        let error = executor
+            .execute(
+                &manual_swap_plan(root),
+                &CancellationToken::default(),
+                |_| {
+                    fs::write(root.join("a.txt"), "sentinel").unwrap();
+                    fs::write(root.join("b.txt"), "block destination").unwrap();
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ExecuteError::Recovery { .. }));
+        drop(executor);
+        let mut executor = Executor::new(Journal::open(database).unwrap());
+        let job = executor.journal().list_jobs(1).unwrap()[0].id;
+        assert_eq!(executor.review(job).unwrap().pending.len(), 2);
+        assert_eq!(executor.rollback(job).unwrap().restored, 0);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"sentinel");
+        fs::remove_file(root.join("a.txt")).unwrap();
+        fs::remove_file(root.join("b.txt")).unwrap();
+        assert_eq!(executor.rollback(job).unwrap().restored, 2);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+    }
+
+    #[test]
+    fn cancellation_recovers_all_outstanding_stages() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let mut plan = manual_swap_plan(root);
+        plan.actions[0].destination = root.join("c.txt");
+        let cancellation = CancellationToken::default();
+        let mut executor = Executor::new(Journal::open(root.join("operations.sqlite")).unwrap());
+        let outcome = executor
+            .execute(&plan, &cancellation, |_| cancellation.cancel())
+            .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+        assert!(
+            executor
+                .journal()
+                .recoverable_items(outcome.job_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(executor.rollback(outcome.job_id).unwrap().restored, 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+    }
+
+    #[test]
+    fn journal_failure_does_not_prevent_stage_restoration() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut plan = manual_swap_plan(root);
+        plan.actions[0].destination = root.join("c.txt");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        let error = executor.execute(&plan, &CancellationToken::default(), |_| {
+            rusqlite::Connection::open(&database).unwrap().execute_batch(
+                "CREATE TRIGGER fail_updates BEFORE UPDATE ON job_items BEGIN SELECT RAISE(FAIL, 'injected ledger failure'); END;"
+            ).unwrap();
+        }).unwrap_err();
+        assert!(error.to_string().contains("c.txt"));
+        assert_eq!(fs::read(root.join("c.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+        drop(executor);
+        let journal = Journal::open(database).unwrap();
+        let job = journal.list_jobs(1).unwrap()[0].id;
+        assert!(
+            journal
+                .recoverable_items(job)
+                .unwrap()
+                .iter()
+                .any(|item| item.destination == root.join("c.txt"))
+        );
+        drop(journal);
+        rusqlite::Connection::open(&root.join("operations.sqlite"))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_updates;")
+            .unwrap();
+        let mut executor = Executor::new(Journal::open(root.join("operations.sqlite")).unwrap());
+        assert_eq!(executor.rollback(job).unwrap().restored, 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+    }
+
+    #[test]
+    fn second_stage_journal_failure_still_restores_first() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let database = root.join("operations.sqlite");
+        let mut executor = Executor::new(Journal::open(&database).unwrap());
+        rusqlite::Connection::open(&database).unwrap().execute_batch(
+            "CREATE TRIGGER fail_second_stage BEFORE UPDATE ON job_items WHEN NEW.item_index = 1 AND NEW.status = 'staged' BEGIN SELECT RAISE(FAIL, 'injected stage journal failure'); END;"
+        ).unwrap();
+        assert!(
+            executor
+                .execute(
+                    &manual_swap_plan(root),
+                    &CancellationToken::default(),
+                    |_| {}
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"B");
+        drop(executor);
+        let journal = Journal::open(database).unwrap();
+        let job = journal.list_jobs(1).unwrap()[0].id;
+        assert!(journal.recoverable_items(job).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_restore_retains_explicit_paths_after_reopening() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "A").unwrap();
+        fs::write(root.join("b.txt"), "B").unwrap();
+        let database = root.join("operations.sqlite");
+        let plan = manual_swap_plan(root);
+        let mut journal = Journal::open(&database).unwrap();
+        let job = journal.create_job(&plan).unwrap();
+        let temp = root.join("retained.partial");
+        journal.mark_staged(job, 0, &temp).unwrap();
+        fs::rename(root.join("a.txt"), &temp).unwrap();
+        // A missing original parent forces a filesystem restoration failure.
+        let source = root.join("missing-parent/a.txt");
+        let result = recover_item(&journal, job, 0, &source, &temp);
+        assert_eq!(result.filesystem_errors.len(), 1);
+        assert_eq!(result.retained[0].0, temp);
+        drop(journal);
+        let journal = Journal::open(database).unwrap();
+        let pending = journal.recoverable_items(job).unwrap();
+        assert_eq!(pending[0].temp, temp);
+        assert!(
+            pending[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("missing-parent")
+        );
+        assert_eq!(fs::read(temp).unwrap(), b"A");
     }
 
     #[test]

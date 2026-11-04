@@ -1204,7 +1204,7 @@ fn select_job(weak: slint::Weak<MainWindow>, state: Arc<AppState>, index: usize)
 
 fn review_detail_text(review: &JobReview) -> String {
     let total = review.items.len();
-    if total == 0 {
+    if total == 0 && review.pending.is_empty() {
         return format!(
             "Job #{} ({}): no applied files remain to review — already rolled back, or nothing was applied.",
             review.job_id,
@@ -1228,6 +1228,17 @@ fn review_detail_text(review: &JobReview) -> String {
     if occupied > 0 {
         text.push_str(&format!(
             " {occupied} original location(s) are occupied again."
+        ));
+    }
+    for item in &review.pending {
+        text.push_str(&format!(
+            " Pending recovery: {} → {} (destination {}; {}).",
+            item.temp.display(),
+            item.source.display(),
+            item.destination.display(),
+            item.reason.as_deref().unwrap_or(
+                "interrupted staging intent; retry will not overwrite an occupied original"
+            )
         ));
     }
     let reversible = review.safely_reversible();
