@@ -32,10 +32,14 @@ jobs:
           "ver=$ver" >> $env:GITHUB_OUTPUT
           Write-Host "Building release $tag (version $ver)"
       - name: Gate
+        shell: pwsh
         run: |
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build release
         run: cargo build --release --locked
       - name: Package installer (NSIS)

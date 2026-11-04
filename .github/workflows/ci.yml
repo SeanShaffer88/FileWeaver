@@ -27,7 +27,11 @@ jobs:
             throw ".project-tier declares '$tier' but this repo is classified t3 in AGENTS.md"
           }
       - name: Gate
+        shell: pwsh
         run: |
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

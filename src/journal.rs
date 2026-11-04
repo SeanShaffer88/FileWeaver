@@ -51,6 +51,18 @@ pub struct AppliedItem {
     pub result_fingerprint: FileFingerprint,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecoverableItem {
+    pub index: usize,
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub temp: PathBuf,
+    pub reason: Option<String>,
+    pub source_fingerprint: FileFingerprint,
+    pub status: String,
+    pub result_fingerprint: Option<FileFingerprint>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackBlockedItem {
     pub index: usize,
@@ -197,6 +209,33 @@ impl Journal {
         Ok(())
     }
 
+    pub fn mark_materializing(
+        &self,
+        job_id: i64,
+        index: usize,
+        destination: &Path,
+        copy: bool,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE job_items SET status = 'materializing', temp_path = CASE WHEN ?1 THEN ?2 ELSE temp_path END WHERE job_id = ?3 AND item_index = ?4",
+            params![copy, path_text(destination), job_id, i64::try_from(index).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_rollback_staged(
+        &self,
+        job_id: i64,
+        index: usize,
+        temp: &Path,
+    ) -> Result<(), JournalError> {
+        self.connection.execute(
+            "UPDATE job_items SET status = 'rollback_staged', temp_path = ?1 WHERE job_id = ?2 AND item_index = ?3",
+            params![path_text(temp), job_id, i64::try_from(index).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_applied(
         &self,
         job_id: i64,
@@ -242,6 +281,38 @@ impl Journal {
             params![now_unix_ms(), status, message, job_id],
         )?;
         Ok(())
+    }
+
+    pub fn recoverable_items(&self, job_id: i64) -> Result<Vec<RecoverableItem>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_index, source_path, destination_path, COALESCE(temp_path, destination_path), error_message, source_size, source_modified_ns, status, result_size, result_modified_ns
+             FROM job_items WHERE job_id = ?1 AND ((temp_path IS NOT NULL AND status IN ('staged', 'failed', 'recovery_pending', 'rollback_staged')) OR status IN ('materializing', 'materialized'))
+             ORDER BY item_index DESC",
+        )?;
+        let items = statement
+            .query_map(params![job_id], |row| {
+                let result_modified: Option<String> = row.get(9)?;
+                Ok(RecoverableItem {
+                    index: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                    source: PathBuf::from(row.get::<_, String>(1)?),
+                    destination: PathBuf::from(row.get::<_, String>(2)?),
+                    temp: PathBuf::from(row.get::<_, String>(3)?),
+                    reason: row.get(4)?,
+                    source_fingerprint: FileFingerprint {
+                        size_bytes: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                        modified_unix_nanos: row
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|value| value.parse().ok()),
+                    },
+                    status: row.get(7)?,
+                    result_fingerprint: row.get::<_, Option<i64>>(8)?.map(|size| FileFingerprint {
+                        size_bytes: u64::try_from(size).unwrap_or(0),
+                        modified_unix_nanos: result_modified.and_then(|value| value.parse().ok()),
+                    }),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
     }
 
     pub fn applied_items(&self, job_id: i64) -> Result<Vec<AppliedItem>, JournalError> {
@@ -424,6 +495,30 @@ mod tests {
             },
             sequence_gaps: vec![],
         }
+    }
+
+    #[test]
+    fn recovery_query_preserves_legacy_stage_identity_without_result_fingerprint() {
+        // Test fixture operations are expected to succeed.
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("operations.sqlite");
+        let mut journal = Journal::open(&database).unwrap();
+        let job = journal.create_job(&plan()).unwrap();
+        journal
+            .mark_staged(job, 0, Path::new("retained.partial"))
+            .unwrap();
+        assert_eq!(journal.recoverable_items(job).unwrap().len(), 1);
+        journal.mark_failed(job, 0, "legacy failure").unwrap();
+        drop(journal);
+        let journal = Journal::open(database).unwrap();
+        let pending = journal.recoverable_items(job).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source, Path::new("source.txt"));
+        assert_eq!(pending[0].destination, Path::new("target.txt"));
+        assert_eq!(pending[0].temp, Path::new("retained.partial"));
+        assert_eq!(pending[0].reason.as_deref(), Some("legacy failure"));
+        assert!(journal.applied_items(job).unwrap().is_empty());
+        assert_eq!(journal.schema_version().unwrap(), 1);
     }
 
     #[test]
